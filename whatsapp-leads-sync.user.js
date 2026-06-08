@@ -45,7 +45,9 @@
     SHARED_SECRET: 'cfg_shared_secret',
     LABEL_NAME: 'cfg_label_name',
     DRY_RUN: 'cfg_dry_run',
-    SENT_PHONES: 'state_sent_phones', // dedup קל בצד הלקוח
+    // dedup קל בצד הלקוח — נשמרים רק hashים, אף פעם לא טלפון בטקסט גלוי.
+    SENT_HASHES: 'state_sent_hashes',
+    SALT: 'state_dedup_salt', // salt אקראי פר-התקנה ל-hash של הטלפונים
   };
 
   const DEFAULT_LABEL_NAME = 'לידים חדשים לטיפול';
@@ -74,9 +76,42 @@
     },
   };
 
-  function getSentPhones() {
+  // ─────────────────────── פרטיות: hashing + masking ──────────────────────
+  // אנחנו לא שומרים טלפונים בטקסט גלוי בשום מקום מתמשך. ל-dedup שומרים רק
+  // SHA-256 של (salt + טלפון). ה-salt אקראי ונוצר פעם אחת פר-התקנה.
+  function bytesToHex(buf) {
+    return [...new Uint8Array(buf)]
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  function getSalt() {
+    let s = GM_getValue(STORE.SALT, '');
+    if (!s) {
+      const rnd = new Uint8Array(16);
+      crypto.getRandomValues(rnd);
+      s = bytesToHex(rnd.buffer);
+      GM_setValue(STORE.SALT, s);
+    }
+    return s;
+  }
+
+  async function hashPhone(phone) {
+    const data = new TextEncoder().encode(getSalt() + '|' + phone);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    return bytesToHex(digest);
+  }
+
+  // מיסוך טלפון לתצוגה בקונסול בלבד: +972***67 (לא חושף את המספר המלא).
+  function maskPhone(phone) {
+    const digits = String(phone || '').replace(/\D/g, '');
+    if (digits.length <= 4) return '***';
+    return '+' + digits.slice(0, 3) + '***' + digits.slice(-2);
+  }
+
+  function getSentHashes() {
     try {
-      const raw = GM_getValue(STORE.SENT_PHONES, '[]');
+      const raw = GM_getValue(STORE.SENT_HASHES, '[]');
       const arr = JSON.parse(raw);
       return new Set(Array.isArray(arr) ? arr : []);
     } catch (e) {
@@ -84,10 +119,10 @@
     }
   }
 
-  function markPhoneSent(phone) {
-    const set = getSentPhones();
-    set.add(phone);
-    GM_setValue(STORE.SENT_PHONES, JSON.stringify([...set]));
+  function markHashSent(hash) {
+    const set = getSentHashes();
+    set.add(hash);
+    GM_setValue(STORE.SENT_HASHES, JSON.stringify([...set]));
   }
 
   // ───────────────────────── תפריטי Tampermonkey ─────────────────────────
@@ -234,11 +269,18 @@
   }
 
   // ───────────────────────────── שליחה ל-CRM ──────────────────────────────
+  // הטלפון נשלח אך ורק כאן, אל ה-webhook המוגדר, ואך ורק מעל HTTPS (מוצפן בתעבורה).
+  // לא מתעדים את גוף התשובה (responseText) — הוא עלול להחזיר את הטלפון ולהדליף אותו לקונסול.
   function postLead(lead) {
     return new Promise((resolve, reject) => {
+      const url = cfg.webhookUrl;
+      if (!/^https:\/\//i.test(url)) {
+        reject(new Error('ה-Webhook חייב להיות HTTPS (כדי שהטלפון יישלח מוצפן).'));
+        return;
+      }
       GM_xmlhttpRequest({
         method: 'POST',
-        url: cfg.webhookUrl,
+        url,
         headers: {
           'Content-Type': 'application/json',
           'x-api-key': cfg.sharedSecret,
@@ -251,8 +293,9 @@
         }),
         timeout: 20000,
         onload: (res) => {
-          if (res.status >= 200 && res.status < 300) resolve(res);
-          else reject(new Error('HTTP ' + res.status + ': ' + (res.responseText || '')));
+          if (res.status >= 200 && res.status < 300) resolve({ status: res.status });
+          // ללא responseText — רק קוד הסטטוס, כדי לא להדליף PII ללוג/קונסול.
+          else reject(new Error('HTTP ' + res.status));
         },
         onerror: () => reject(new Error('שגיאת רשת בשליחה')),
         ontimeout: () => reject(new Error('timeout בשליחה')),
@@ -279,8 +322,10 @@
       const WPP = await waitForWPP();
       const leads = await collectLeads(WPP);
 
-      const sent = getSentPhones();
-      const fresh = leads.filter((l) => !sent.has(l.phone));
+      // dedup לפי hash בלבד — אף פעם לא משווים/שומרים טלפון בטקסט גלוי.
+      const sent = getSentHashes();
+      for (const l of leads) l.hash = await hashPhone(l.phone);
+      const fresh = leads.filter((l) => !sent.has(l.hash));
 
       if (fresh.length === 0) {
         setBtnState('idle', 'סנכרן לידים');
@@ -299,8 +344,9 @@
           '%c[Leads Sync] DRY_RUN — לא נשלח כלום. הלידים החדשים:',
           'font-weight:bold'
         );
+        // מציגים טלפון ממוסך בלבד (לא המספר המלא), והשם לזיהוי הליד.
         console.table(
-          fresh.map((l) => ({ phone: l.phone, name: l.name }))
+          fresh.map((l) => ({ phone: maskPhone(l.phone), name: l.name }))
         );
         alert(
           'DRY_RUN: נמצאו ' +
@@ -317,11 +363,16 @@
       for (const lead of fresh) {
         try {
           await postLead(lead);
-          markPhoneSent(lead.phone); // dedup רק אחרי הצלחה
+          markHashSent(lead.hash); // dedup רק אחרי הצלחה — נשמר hash, לא טלפון
           okCount++;
         } catch (e) {
           failCount++;
-          console.warn('[Leads Sync] כשל בשליחת', lead.phone, e);
+          // טלפון ממוסך בלבד בקונסול, ורק הודעת השגיאה (ללא גוף תשובה).
+          console.warn(
+            '[Leads Sync] כשל בשליחת',
+            maskPhone(lead.phone),
+            e && e.message ? e.message : e
+          );
         }
         await sleep(randDelay());
       }
