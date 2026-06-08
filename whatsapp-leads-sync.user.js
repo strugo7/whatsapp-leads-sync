@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.3.1
+// @version      1.4.0
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
@@ -41,20 +41,19 @@
   'use strict';
 
   // לוג טעינה — אם השורה הזו לא מופיעה בקונסול, הסקריפט עצמו לא רץ (בד"כ @require נכשל).
-  console.log('%c[Leads Sync] v1.3.1 נטען', 'color:#00a884;font-weight:bold');
+  console.log('%c[Leads Sync] v1.4.0 נטען', 'color:#00a884;font-weight:bold');
 
   // ───────────────────────────── מפתחות אחסון ─────────────────────────────
   const STORE = {
     WEBHOOK_URL: 'cfg_webhook_url',
     SHARED_SECRET: 'cfg_shared_secret',
-    LABEL_NAME: 'cfg_label_name',
+    LABEL_NAME: 'cfg_label_name', // ישן — נשמר לקריאת מיגרציה בלבד
+    LABELS: 'cfg_labels', // JSON של מערך [{id, name}] — בחירת תגיות מרובה
     DRY_RUN: 'cfg_dry_run',
   };
 
   // כל מפתחות האחסון המקומיים — לשימוש כפתור "מחק נתונים מקומיים".
   const ALL_STORE_KEYS = Object.values(STORE);
-
-  const DEFAULT_LABEL_NAME = 'לידים חדשים לטיפול';
 
   // השהיה אנושית בין שליחות (מילישניות) — נבחר אקראי בטווח כדי לא להיראות כבוט.
   const SEND_DELAY_MIN_MS = 600;
@@ -68,8 +67,20 @@
     get sharedSecret() {
       return (GM_getValue(STORE.SHARED_SECRET, '') || '').trim();
     },
-    get labelName() {
-      return (GM_getValue(STORE.LABEL_NAME, DEFAULT_LABEL_NAME) || DEFAULT_LABEL_NAME).trim();
+    // התגיות שנבחרו לסנכרון — מערך של {id, name}. עם מיגרציה מהמפתח הישן (תגית בודדת).
+    get selectedLabels() {
+      try {
+        const raw = GM_getValue(STORE.LABELS, '');
+        if (raw) {
+          const arr = JSON.parse(raw);
+          if (Array.isArray(arr)) return arr.filter((x) => x && x.name);
+        }
+      } catch (e) {
+        /* נופל למיגרציה */
+      }
+      // מיגרציה: אם קיים שם תגית ישן בודד — להמיר לרשימה.
+      const legacy = (GM_getValue(STORE.LABEL_NAME, '') || '').trim();
+      return legacy ? [{ id: null, name: legacy }] : [];
     },
     // DRY_RUN ברירת מחדל: true (לא שולח כלום, רק מדפיס).
     get dryRun() {
@@ -148,18 +159,24 @@
         );
       }
 
-      // 4) כמה צ'אטים מזוהים תחת התגית המוגדרת (אימות הצינור מקצה לקצה)
-      const label = labels.find((l) => String(l.name).trim() === cfg.labelName);
-      if (!label) {
-        console.warn('לא נמצאה תגית בשם:', cfg.labelName);
+      // 4) כמה צ'אטים מזוהים תחת כל אחת מהתגיות הנבחרות (אימות הצינור מקצה לקצה)
+      const selected = cfg.selectedLabels;
+      if (selected.length === 0) {
+        console.warn('לא נבחרו תגיות בהגדרות.');
       } else {
-        const count = chats.filter((c) =>
-          chatHasLabel(c, String(label.id))
-        ).length;
-        console.log(
-          'צ\'אטים שזוהו תחת התגית "' + cfg.labelName + '":',
-          count
-        );
+        for (const sel of selected) {
+          const label = labels.find(
+            (l) =>
+              (sel.id != null && String(l.id) === String(sel.id)) ||
+              String(l.name).trim() === String(sel.name).trim()
+          );
+          if (!label) {
+            console.warn('לא נמצאה תגית:', sel.name);
+            continue;
+          }
+          const count = chats.filter((c) => chatHasLabel(c, String(label.id))).length;
+          console.log('צ\'אטים תחת התגית "' + label.name + '":', count);
+        }
       }
       const okMsg = 'בדיקת Step 0 הסתיימה — פרטים מלאים ב-Console (F12).';
       if (ui.built) ui.status(okMsg, 'success');
@@ -215,28 +232,42 @@
     Math.floor(Math.random() * (SEND_DELAY_MAX_MS - SEND_DELAY_MIN_MS + 1));
 
   // ──────────────────────── שליפת לידים (READ-ONLY) ───────────────────────
-  // מחזיר מערך של { phone, name, wid } עבור הצ'אטים שתחת התגית.
-  async function collectLeads(WPP) {
-    const labelName = cfg.labelName;
-
-    // 1) פותרים את ה-id של התגית לפי שם (READ).
-    const labels = await WPP.labels.getAllLabels();
-    const label = (labels || []).find(
-      (l) => (l && l.name ? String(l.name).trim() : '') === labelName
-    );
-    if (!label) {
-      throw new Error(
-        'לא נמצאה תגית בשם "' + labelName + '". בדוק את שם התגית בהגדרות.'
-      );
+  // מחזיר מערך של { phone, name, wid, labels } עבור הצ'אטים שתחת התגיות הנבחרות.
+  // labelsOverride (אופציונלי) — מערך [{id,name}] לתצוגה מקדימה לפני שמירה; ברירת מחדל cfg.selectedLabels.
+  async function collectLeads(WPP, labelsOverride) {
+    const selected = labelsOverride || cfg.selectedLabels;
+    if (!selected || selected.length === 0) {
+      throw new Error('לא נבחרו תגיות. פתח "הגדרות" וסמן לפחות תגית אחת.');
     }
-    const labelId = String(label.id);
 
-    // 2) שולפים את כל הצ'אטים ומסננים לפי חברות בתגית (READ).
+    // 1) שולפים את כל התגיות הקיימות ובונים מפה id→name.
+    const allLabels = (await WPP.labels.getAllLabels()) || [];
+    const idToName = new Map();
+    const nameToId = new Map();
+    for (const l of allLabels) {
+      idToName.set(String(l.id), String(l.name));
+      nameToId.set(String(l.name).trim(), String(l.id));
+    }
+
+    // פותרים את ה-ids הנבחרים: מעדיפים id קיים, אחרת מתאימים לפי שם (מיגרציה).
+    const selectedIds = new Set();
+    for (const sel of selected) {
+      const byId = sel.id != null && idToName.has(String(sel.id)) ? String(sel.id) : null;
+      const byName = !byId && sel.name ? nameToId.get(String(sel.name).trim()) : null;
+      if (byId) selectedIds.add(byId);
+      else if (byName) selectedIds.add(byName);
+    }
+    if (selectedIds.size === 0) {
+      throw new Error('התגיות שנבחרו לא נמצאו בחשבון. פתח "הגדרות" ובחר מחדש.');
+    }
+
+    // 2) שולפים את כל הצ'אטים ומסננים לפי חברות באחת מהתגיות הנבחרות (READ).
     const chats = await WPP.chat.list();
 
-    const leads = [];
+    const byPhone = new Map(); // dedup: צ'אט תחת כמה תגיות נבחרות → ליד אחד.
     for (const chat of chats || []) {
-      if (!chatHasLabel(chat, labelId)) continue;
+      const matchedIds = [...selectedIds].filter((id) => chatHasLabel(chat, id));
+      if (matchedIds.length === 0) continue;
 
       // טלפון מה-WID: כבר בפורמט בינלאומי קנוני (למשל 972501234567@c.us).
       // מוסיפים + בלבד — בלי נירמול ידני.
@@ -248,14 +279,25 @@
       const server = wid && wid.server ? String(wid.server) : '';
       if (server === 'g.us') continue;
 
-      leads.push({
-        phone: '+' + user,
-        wid: user + '@' + (server || 'c.us'),
-        name: chat.name || chat.formattedTitle || '',
-      });
+      const phone = '+' + user;
+      const matchedNames = matchedIds.map((id) => idToName.get(id)).filter(Boolean);
+      if (byPhone.has(phone)) {
+        // צ'אט/טלפון שכבר נראה — מאחדים את שמות התגיות.
+        const existing = byPhone.get(phone);
+        for (const n of matchedNames) {
+          if (!existing.labels.includes(n)) existing.labels.push(n);
+        }
+      } else {
+        byPhone.set(phone, {
+          phone,
+          wid: user + '@' + (server || 'c.us'),
+          name: chat.name || chat.formattedTitle || '',
+          labels: matchedNames,
+        });
+      }
     }
 
-    return leads;
+    return [...byPhone.values()];
   }
 
   // ⚠️ TODO: אמת מול גרסת wa-js שלך איפה יושבות תגיות הצ'אט — ראה Step 0 ב-README.
@@ -303,6 +345,7 @@
     const body = JSON.stringify({
       phone: lead.phone,
       name: lead.name,
+      labels: lead.labels || [], // שמות התגיות שמהן הגיע הליד
       source: 'whatsapp-web',
       synced_at: new Date().toISOString(),
     });
@@ -347,16 +390,21 @@
         ui.showSettings(true);
         return;
       }
+      if (cfg.selectedLabels.length === 0) {
+        ui.status('לא נבחרו תגיות. פתח "הגדרות" וסמן לפחות תגית אחת.', 'error');
+        ui.showSettings(true);
+        return;
+      }
 
       ui.status('טוען את WhatsApp…', 'info');
       const WPP = await waitForWPP();
-      ui.status('קורא לידים מהתגית…', 'info');
+      ui.status('קורא לידים מהתגיות…', 'info');
       const leads = await collectLeads(WPP);
 
       // אין dedup מקומי — לא שומרים כלום על המכשיר. ה-dedup הסופי הוא ה-upsert
       // בשרת (לפי טלפון), כך שאפשר לשלוח את אותו ליד שוב בלי ליצור כפילות.
       if (leads.length === 0) {
-        ui.status('לא נמצאו צ\'אטים תחת התגית "' + cfg.labelName + '".', 'warn');
+        ui.status('לא נמצאו צ\'אטים תחת התגיות שנבחרו.', 'warn');
         return;
       }
 
@@ -468,6 +516,15 @@
     }
     .settings-actions { display: flex; gap: 8px; }
     button.small { padding: 8px; font-size: 13px; }
+    .lbl-head { display: flex; align-items: center; justify-content: space-between; }
+    .lbl-head .link { background: none; border: none; color: ${WA_GREEN}; cursor: pointer; font-size: 12px; font-weight: 600; padding: 0; }
+    .lbl-list { max-height: 160px; overflow-y: auto; border: 1px solid #d1d7db; border-radius: 8px; padding: 6px 8px; margin-top: 4px; }
+    .lbl-row { display: flex; align-items: center; gap: 8px; padding: 5px 2px; font-weight: 500; color: #111b21; cursor: pointer; }
+    .lbl-row input { width: auto; margin: 0; }
+    .lbl-dot { width: 11px; height: 11px; border-radius: 50%; flex: 0 0 auto; border: 1px solid rgba(0,0,0,.15); }
+    .lbl-muted { color: #8696a0; font-size: 12px; padding: 6px 2px; }
+    .lbl-count { font-size: 12px; color: #54656f; margin-top: 6px; font-weight: 600; }
+    button.ghost.preview { margin-top: 8px; }
     button.danger { border: 1px solid #f1b0ad; background: #fff; color: #b02a24; border-radius: 8px; cursor: pointer; font-weight: 600; flex: 1; }
     .status { margin-top: 12px; font-size: 13px; min-height: 18px; line-height: 1.4; }
     .status.info { color: #54656f; }
@@ -507,10 +564,14 @@
           <label>סוד משותף (לחתימת HMAC)
             <input type="password" id="wals-secret" placeholder="••••••••">
           </label>
-          <label>שם התגית
-            <input type="text" id="wals-label">
-          </label>
-          <div class="settings-actions">
+          <div class="lbl-head">
+            <label style="margin-bottom:4px">תגיות לסנכרון (בחירה מרובה)</label>
+            <button class="link" id="wals-labels-reload">רענן</button>
+          </div>
+          <div class="lbl-list" id="wals-labels"><div class="lbl-muted">פתח כדי לטעון תגיות…</div></div>
+          <div class="lbl-count" id="wals-labels-count"></div>
+          <button class="ghost preview" id="wals-preview">תצוגה מקדימה</button>
+          <div class="settings-actions" style="margin-top:10px">
             <button class="primary small" id="wals-save">שמור</button>
             <button class="danger small" id="wals-clear">מחק נתונים</button>
           </div>
@@ -549,7 +610,9 @@
         conn: $('wals-conn'), mode: $('wals-mode'), sync: $('wals-sync'),
         dry: $('wals-dry'), step0: $('wals-step0'), settingsBtn: $('wals-settings-btn'),
         settings: $('wals-settings'), url: $('wals-url'), secret: $('wals-secret'),
-        label: $('wals-label'), save: $('wals-save'), clear: $('wals-clear'),
+        labels: $('wals-labels'), labelsCount: $('wals-labels-count'),
+        labelsReload: $('wals-labels-reload'), preview: $('wals-preview'),
+        save: $('wals-save'), clear: $('wals-clear'),
         status: $('wals-status'), results: $('wals-results'),
       };
 
@@ -559,6 +622,8 @@
       r.sync.addEventListener('click', syncLeads);
       r.step0.addEventListener('click', runLabelDiagnostics);
       r.settingsBtn.addEventListener('click', () => this.showSettings());
+      r.labelsReload.addEventListener('click', () => this.loadLabels(true));
+      r.preview.addEventListener('click', () => this.previewLeads());
       r.save.addEventListener('click', () => this.saveSettings());
       r.clear.addEventListener('click', clearLocalData);
       r.dry.addEventListener('change', () => {
@@ -579,6 +644,93 @@
       if (!this.built) return;
       const s = this.refs.settings;
       s.hidden = force === true ? false : !s.hidden;
+      if (!s.hidden) this.loadLabels(); // טוען תגיות כשנפתח (אם עוד לא נטענו)
+    },
+
+    // טוען את התגיות מחשבון ה-WhatsApp ומציג כצ'קבוקסים. force=true → טעינה מחדש.
+    async loadLabels(force) {
+      if (!this.built) return;
+      if (this._labelsLoaded && !force) return;
+      const box = this.refs.labels;
+      box.innerHTML = '<div class="lbl-muted">טוען תגיות…</div>';
+      try {
+        const WPP = await waitForWPP();
+        const labels = (await WPP.labels.getAllLabels()) || [];
+        if (labels.length === 0) {
+          box.innerHTML = '<div class="lbl-muted">לא נמצאו תגיות בחשבון.</div>';
+          this._labelsLoaded = true;
+          return;
+        }
+        // אילו מסומנות לפי מה ששמור (התאמה לפי id או שם).
+        const selected = cfg.selectedLabels;
+        const isSel = (l) =>
+          selected.some(
+            (s) =>
+              (s.id != null && String(s.id) === String(l.id)) ||
+              (s.name && String(s.name).trim() === String(l.name).trim())
+          );
+        box.innerHTML = labels
+          .map((l) => {
+            const color = labelColor(l);
+            const dot = color
+              ? '<span class="lbl-dot" style="background:' + color + '"></span>'
+              : '<span class="lbl-dot" style="background:#ccc"></span>';
+            return (
+              '<label class="lbl-row">' +
+              '<input type="checkbox" data-id="' + escapeHtml(l.id) +
+              '" data-name="' + escapeHtml(l.name) + '"' + (isSel(l) ? ' checked' : '') + '>' +
+              dot +
+              '<span>' + escapeHtml(l.name) + '</span>' +
+              '</label>'
+            );
+          })
+          .join('');
+        box.querySelectorAll('input[type=checkbox]').forEach((cb) =>
+          cb.addEventListener('change', () => this.updateLabelsCount())
+        );
+        this._labelsLoaded = true;
+        this.updateLabelsCount();
+      } catch (e) {
+        box.innerHTML =
+          '<div class="lbl-muted">לא ניתן לטעון תגיות — ודא ש-WhatsApp נטען, ולחץ "רענן".</div>';
+        console.warn('[Leads Sync] loadLabels:', e);
+      }
+    },
+
+    getCheckedLabels() {
+      if (!this.built) return [];
+      return [...this.refs.labels.querySelectorAll('input[type=checkbox]:checked')].map((cb) => ({
+        id: cb.getAttribute('data-id') || null,
+        name: cb.getAttribute('data-name') || '',
+      }));
+    },
+
+    updateLabelsCount() {
+      if (!this.built) return;
+      const n = this.getCheckedLabels().length;
+      this.refs.labelsCount.textContent = n ? 'נבחרו ' + n + ' תגיות' : 'לא נבחרו תגיות';
+    },
+
+    async previewLeads() {
+      const checked = this.getCheckedLabels();
+      if (checked.length === 0) {
+        this.status('סמן לפחות תגית אחת לתצוגה מקדימה.', 'warn');
+        return;
+      }
+      this.clearResults();
+      this.status('טוען תצוגה מקדימה…', 'info');
+      try {
+        const WPP = await waitForWPP();
+        const leads = await collectLeads(WPP, checked);
+        if (leads.length === 0) {
+          this.status('אין צ\'אטים תחת התגיות שנבחרו.', 'warn');
+          return;
+        }
+        this.showLeadsTable(leads.map((l) => ({ phone: maskPhone(l.phone), name: l.name })));
+        this.status('תצוגה מקדימה: ' + leads.length + ' לידים (טלפונים ממוסכים).', 'success');
+      } catch (e) {
+        this.status('שגיאה בתצוגה מקדימה: ' + (e && e.message ? e.message : e), 'error');
+      }
     },
 
     setBusy(busy) {
@@ -613,7 +765,7 @@
       const r = this.refs;
       GM_setValue(STORE.WEBHOOK_URL, r.url.value.trim());
       GM_setValue(STORE.SHARED_SECRET, r.secret.value.trim());
-      GM_setValue(STORE.LABEL_NAME, r.label.value.trim() || DEFAULT_LABEL_NAME);
+      GM_setValue(STORE.LABELS, JSON.stringify(this.getCheckedLabels()));
       this.refresh();
       this.status('ההגדרות נשמרו.', 'success');
     },
@@ -623,15 +775,28 @@
       const r = this.refs;
       r.url.value = cfg.webhookUrl;
       r.secret.value = cfg.sharedSecret;
-      r.label.value = cfg.labelName;
       r.dry.checked = cfg.dryRun;
       const configured = cfg.isConfigured();
       r.conn.textContent = configured ? 'מחובר ל-CRM' : 'לא מוגדר';
       r.conn.className = 'badge ' + (configured ? 'ok' : 'err');
       r.mode.textContent = cfg.dryRun ? 'DRY_RUN' : 'שליחה אמיתית';
       r.mode.className = 'badge ' + (cfg.dryRun ? 'warn' : 'ok');
+      if (this._labelsLoaded) this.updateLabelsCount();
     },
   };
+
+  // צבע התגית מ-wa-js עשוי להגיע כ-hex ('#abc...') או כמספר ARGB/RGB. מחזיר CSS color או null.
+  function labelColor(l) {
+    const c = l && (l.color != null ? l.color : l.colorHex);
+    if (c == null) return null;
+    if (typeof c === 'string') return c.startsWith('#') ? c : '#' + c;
+    if (typeof c === 'number') {
+      // מספר → hex של 6 ספרות (מתעלמים מ-alpha אם קיים).
+      const hex = (c >>> 0).toString(16).padStart(8, '0').slice(-6);
+      return '#' + hex;
+    }
+    return null;
+  }
 
   // הימלטות בסיסית למניעת HTML injection בתצוגת השם/טלפון בפאנל.
   function escapeHtml(s) {

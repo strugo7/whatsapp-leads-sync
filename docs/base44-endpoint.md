@@ -23,10 +23,14 @@ X-Signature: <hex של HMAC-SHA256(secret, "<X-Timestamp>.<גוף הבקשה ה�
 {
   "phone": "+972501234567",
   "name": "שם הצ'אט כפי שמופיע ב-WhatsApp",
+  "labels": ["לידים חדשים לטיפול", "צילומי חתונה"],
   "source": "whatsapp-web",
   "synced_at": "2026-06-08T10:30:00.000Z"
 }
 ```
+
+> `labels` הוא מערך שמות התגיות שמהן הגיע הליד (יכול להכיל יותר מאחת אם הצ'אט תויג
+> בכמה מהתגיות שנבחרו). השדה נחתם כחלק מה-body ב-HMAC, כמו שאר הגוף.
 
 ## מה ה-endpoint צריך לעשות
 
@@ -74,14 +78,14 @@ export default async function handler(req) {
   if (!ok) return new Response('Bad signature', { status: 401 });
 
   // 4) פענוח ה-payload ו-upsert לפי טלפון
-  const { phone, name, source, synced_at } = JSON.parse(rawBody);
+  const { phone, name, labels, source, synced_at } = JSON.parse(rawBody);
   if (!phone) return new Response('Missing phone', { status: 400 });
 
   const existing = await Leads.filter({ phone }); // דוגמה — החלף ב-API האמיתי
   if (existing && existing.length > 0) {
-    await Leads.update(existing[0].id, { name, last_seen: synced_at });
+    await Leads.update(existing[0].id, { name, labels, last_seen: synced_at });
   } else {
-    await Leads.create({ phone, name, source, created_at: synced_at });
+    await Leads.create({ phone, name, labels, source, created_at: synced_at });
   }
 
   // 5) write-only — לא מחזירים נתוני לידים
