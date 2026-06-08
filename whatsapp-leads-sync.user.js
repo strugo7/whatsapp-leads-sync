@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.5.1
+// @version      1.6.1
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
 // @run-at       document-idle
-// @require      https://cdn.jsdelivr.net/npm/@wppconnect/wa-js@4.3.2-alpha.0/dist/wppconnect-wa.js
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      base44.app
 // @updateURL    https://raw.githubusercontent.com/strugo7/whatsapp-leads-sync/main/whatsapp-leads-sync.user.js
 // @downloadURL  https://raw.githubusercontent.com/strugo7/whatsapp-leads-sync/main/whatsapp-leads-sync.user.js
 // ==/UserScript==
@@ -27,9 +27,10 @@
  *    • אין סודות בקוד — WEBHOOK_URL / SHARED_SECRET / תגיות נשמרים מקומית
  *      ב-localStorage דרך טופס ההגדרות בפאנל. לכן מותר לפרסם ציבורית.
  *
- *  ארכיטקטורה: רץ עם @grant none כדי ש-wa-js יתאתחל בהקשר הדף (תחת @grant +
- *  sandbox הוא לא מצליח להתחבר ל-webpack של WhatsApp). לכן: השליחה ב-fetch
- *  (ה-endpoint צריך CORS), והאחסון ב-localStorage.
+ *  ארכיטקטורה: רץ עם @grant GM_xmlhttpRequest כדי לעקוף CSP של WhatsApp Web
+ *  (שחוסם fetch לדומיינים חיצוניים כמו base44.app). חובה ש-@connect יכיל את
+ *  הדומיין (host) בלבד — לא URL מלא — אחרת Tampermonkey יחסום את הבקשה. הקריאה מ-IndexedDB
+ *  עובדת גם ב-sandbox (אותו origin). האחסון ב-localStorage.
  *
  *  לפני שימוש ראשון: ראה "Step 0" ב-README — בדיקה שמאמתת איפה wa-js
  *  מחזיק את תגיות הצ'אט בגרסה הספציפית שלך.
@@ -40,7 +41,7 @@
   'use strict';
 
   // לוג טעינה — אם השורה הזו לא מופיעה בקונסול, הסקריפט עצמו לא רץ (בד"כ @require נכשל).
-  console.log('%c[Leads Sync] v1.5.1 נטען', 'color:#00a884;font-weight:bold');
+  console.log('%c[Leads Sync] v1.6.1 נטען', 'color:#00a884;font-weight:bold');
 
   // ───────────────────────────── מפתחות אחסון ─────────────────────────────
   const STORE = {
@@ -149,64 +150,29 @@
   // הערה: תחת @grant none אין GM_registerMenuCommand — כל הפעולות זמינות דרך
   // הפאנל ה-GUI (כפתור צף → סנכרון / בדיקת תגיות / הגדרות / מחיקת נתונים).
 
-  // Step 0 — בדיקת מבנה התגיות. מדפיס לקונסול את התגיות ומבנה הצ'אט לאימות.
+  // Step 0 — בדיקת מבנה התגיות. מדפיס לקונסול את התגיות ומבנה הצ'אט מתוך IndexedDB.
   async function runLabelDiagnostics() {
     try {
-      console.log(
-        '%c[Leads Sync] Step 0 — בדיקת תגיות',
-        'font-weight:bold;font-size:14px'
-      );
+      console.log('%c[Leads Sync] Step 0 — בדיקת תגיות (IndexedDB)', 'font-weight:bold;font-size:14px');
+      const db = await openWaModelDb();
+      console.log('Stores זמינים:', [...db.objectStoreNames]);
+      
+      const allLabels = await readIdbLabels(db);
+      console.table(allLabels.map((l) => ({ id: l.id, name: l.name })));
 
-      // מצב WPP גולמי לפני ההמתנה — עוזר לאבחן כשל "לא מוכן בזמן".
-      const W = window.WPP;
-      console.log('מצב WPP:', {
-        קיים: typeof W !== 'undefined',
-        version: W && W.version,
-        isReady: W && W.isReady,
-        isMainReady: W && W.isMainReady,
-        hasWaitReady: !!(W && typeof W.waitReady === 'function'),
-      });
-
-      const WPP = await waitForWPP();
-
-      // 1) ה-API הזמין תחת WPP.labels בגרסת wa-js שלך
-      console.log('WPP.labels keys:', Object.keys(WPP.labels).sort());
-
-      // 2) רשימת התגיות (id + שם)
-      const labels = (await WPP.labels.getAllLabels()) || [];
-      console.table(labels.map((l) => ({ id: l.id, name: l.name })));
-
-      // 3) מבנה התגיות בצ'אט לדוגמה — מדפיסים רק מפתחות ושדה labels, בלי לחשוף טלפון.
-      const chats = (await WPP.chat.list()) || [];
-      const sample = chats.find((c) => c && c.labels);
-      if (sample) {
-        console.log('מפתחות chat לדוגמה:', Object.keys(sample));
-        console.log('chat.labels לדוגמה:', sample.labels);
-      } else {
-        console.log(
-          'לא נמצא צ\'אט עם שדה labels — ייתכן שהמבנה שונה בגרסה שלך. בדוק Object.keys(chat) ועדכן את chatHasLabel().'
-        );
-      }
-
-      // 4) כמה צ'אטים מזוהים תחת כל אחת מהתגיות הנבחרות (אימות הצינור מקצה לקצה)
+      const nameById = new Map(allLabels.map((l) => [l.id, l.name]));
       const selected = cfg.selectedLabels;
       if (selected.length === 0) {
         console.warn('לא נבחרו תגיות בהגדרות.');
       } else {
-        for (const sel of selected) {
-          const label = labels.find(
-            (l) =>
-              (sel.id != null && String(l.id) === String(sel.id)) ||
-              String(l.name).trim() === String(sel.name).trim()
-          );
-          if (!label) {
-            console.warn('לא נמצאה תגית:', sel.name);
-            continue;
-          }
-          const count = chats.filter((c) => chatHasLabel(c, String(label.id))).length;
-          console.log('צ\'אטים תחת התגית "' + label.name + '":', count);
+        const labelIds = selected.map(s => String(s.id));
+        const leads = await collectLabeledLeads(db, labelIds, nameById);
+        console.log('נמצאו ' + leads.length + ' לידים תחת התגיות הנבחרות.');
+        if (leads.length > 0) {
+           console.log('דוגמה לליד ראשון:', { ...leads[0], phone: maskPhone(leads[0].phone) });
         }
       }
+      db.close();
       const okMsg = 'בדיקת Step 0 הסתיימה — פרטים מלאים ב-Console (F12).';
       if (ui.built) ui.status(okMsg, 'success');
       else alert(okMsg);
@@ -234,49 +200,161 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // ──────────────────────────── המתנה ל-wa-js ─────────────────────────────
-  // ממתינים עד ש-WPP נטען ומאותחל. מבדיל בין שני כשלים:
-  //   • WPP לא קיים כלל → ה-@require של wa-js לא נטען.
-  //   • WPP קיים אך לא "ready" בזמן → WhatsApp עדיין נטען / חוסר תאימות גרסה.
-  // ב-wa-js 4.x ה-API הוא WPP.onReady(cb) (אין waitReady). נופלים ל-polling של isReady.
-  async function waitForWPP(timeoutMs = 90000) {
-    const started = Date.now();
+  // ───────────── ייצוא אנשי קשר ל-CSV (מקור: IndexedDB, ללא wa-js) ─────────
+  // wa-js תלוי ב-isReady; כשהוא לא מגיע ל-ready (חוסר תאימות גרסה) אין דרך לקרוא
+  // אנשי קשר דרכו. כאן קוראים ישירות מ-IndexedDB של WhatsApp — READ-ONLY מוחלט:
+  // פותחים בלי version (לא יוצרים/משדרגים), transaction של readonly בלבד, וסוגרים.
+  // חריגה מודעת מאינווריאנט "אין טלפונים מקומית": ה-CSV המורד מכיל טלפונים מלאים
+  // (ביוזמת המשתמש). הקונסול והפאנל נשארים ממוסכים. ראה CLAUDE.md.
 
-    // 1) להמתין שאובייקט ה-WPP בכלל יופיע (אחרת ה-@require נכשל / לא בהקשר הדף).
-    while (typeof window.WPP === 'undefined') {
-      if (Date.now() - started > 15000) {
-        throw new Error('wa-js (WPP) לא נטען כלל — בדוק חיבור/@require והתקנה מחדש.');
-      }
-      await sleep(300);
+  function openIdb(name) {
+    return new Promise((resolve, reject) => {
+      // ללא version → פותחים DB קיים בלבד; לא יוצרים ולא משדרגים (שומר READ-ONLY).
+      const req = indexedDB.open(name);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error('open failed'));
+      req.onblocked = () => reject(new Error('open blocked'));
+      // אם ה-DB לא קיים, open ינסה ליצור (version 1) → מבטלים כדי לא לכתוב כלום.
+      req.onupgradeneeded = () => {
+        try { req.transaction.abort(); } catch (e) { }
+        reject(new Error('db missing'));
+      };
+    });
+  }
+
+  // קורא {key, value} עבור כל הרשומות ב-store (cursor — כי לפעמים ה-id קיים רק במפתח).
+  function idbReadAll(db, storeName) {
+    return new Promise((resolve, reject) => {
+      const out = [];
+      const req = db.transaction(storeName, 'readonly').objectStore(storeName).openCursor();
+      req.onsuccess = (e) => {
+        const cur = e.target.result;
+        if (!cur) { resolve(out); return; }
+        out.push({ key: cur.key, value: cur.value });
+        cur.continue();
+      };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  const firstNonEmpty = (...vals) => {
+    for (const v of vals) {
+      const s = v == null ? '' : String(v).trim();
+      if (s) return s;
     }
+    return '';
+  };
 
-    const WPP = window.WPP;
-    if (WPP.isReady) return WPP;
-
-    // 2) הדרך הרשמית: WPP.onReady(cb) — נרשמים לאירוע, עם timeout.
-    const notReady = new Error(
-      'wa-js (WPP) נטען אך לא הגיע ל-ready בזמן — ודא ש-WhatsApp Web פתוח ומחובר.'
-    );
-    if (typeof WPP.onReady === 'function') {
-      let timer;
-      const ready = new Promise((resolve) => WPP.onReady(resolve));
-      const timeout = new Promise((_, rej) => {
-        timer = setTimeout(() => rej(notReady), timeoutMs);
-      });
+  // get בודד לפי מפתח (READ-ONLY). מחזיר value או null, בלי לזרוק.
+  function idbGet(db, storeName, key) {
+    return new Promise((resolve) => {
       try {
-        await Promise.race([ready, timeout]);
-        return WPP;
-      } finally {
-        clearTimeout(timer);
+        const req = db.transaction(storeName, 'readonly').objectStore(storeName).get(key);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => resolve(null);
+      } catch (e) {
+        resolve(null);
       }
-    }
+    });
+  }
 
-    // 3) נפילה: polling על isReady.
-    while (!WPP.isReady) {
-      if (Date.now() - started > timeoutMs) throw notReady;
-      await sleep(500);
+  // טלפון מתוך jid כמו "972546533801@c.us" או כמספר טהור → "+972546533801". @lid/@g.us/אחר → null.
+  // (וואטסאפ עברו ל-LID: רשומת contact ממופתחת ב-@lid, והטלפון בשדה phoneNumber)
+  function waPhoneFromJid(jid) {
+    const s = String(jid || '');
+    if (s.endsWith('@lid') || s.endsWith('@g.us')) return null;
+    const m = /^\+?(\d{5,})(?:@(?:c\.us|s\.whatsapp\.net))?$/.exec(s);
+    return m ? '+' + m[1] : null;
+  }
+
+  // מאתר ופותח את ה-DB של WhatsApp שמכיל את ה-stores contact + label (בד"כ "model-storage").
+  async function openWaModelDb() {
+    if (typeof indexedDB.databases !== 'function') {
+      throw new Error('indexedDB.databases() לא נתמך בדפדפן הזה — נסה Chrome עדכני.');
     }
-    return WPP;
+    const names = (await indexedDB.databases()).map((d) => d.name).filter(Boolean);
+    // עדיפות ל-model-storage, אבל מאמתים לפי תוכן (קיום contact + label).
+    names.sort((a, b) => (/model-storage/i.test(b) ? 1 : 0) - (/model-storage/i.test(a) ? 1 : 0));
+    for (const name of names) {
+      let db;
+      try { db = await openIdb(name); } catch (e) { continue; }
+      const stores = [...db.objectStoreNames];
+      const hasContact = stores.includes('contact');
+      const hasLabel = stores.includes('label') || stores.includes('labels');
+      if (hasContact && hasLabel) return db;
+      try { db.close(); } catch (e) { }
+    }
+    throw new Error('לא נמצא ה-IndexedDB של WhatsApp (contact + label). ודא ש-WhatsApp Web פתוח ומחובר.');
+  }
+
+  // קורא את ה-store "label" (או "labels") → [{ id, name, color }].
+  async function readIdbLabels(db) {
+    const storeName = [...db.objectStoreNames].includes('label') ? 'label' : 'labels';
+    const recs = await idbReadAll(db, storeName);
+    return recs.map(({ key, value }) => {
+      const v = value || {};
+      const id = String(v.id != null ? v.id : key);
+      return {
+        id,
+        name: firstNonEmpty(v.name, v.labelName, v.text) || ('תגית ' + id),
+        color: v.color != null ? v.color : v.colorHex,
+      };
+    });
+  }
+
+  // אוסף לידים תחת התגיות הנבחרות: label-association → associationId → contact.phoneNumber.
+  // מדלג על קבוצות (@g.us). מאחד לפי jid וצובר את שמות התגיות התואמות.
+  async function collectLabeledLeads(db, labelIds, nameById) {
+    const want = new Set(labelIds.map(String));
+    const stores = [...db.objectStoreNames];
+    const assocStore = stores.includes('label-association') ? 'label-association' : (stores.includes('labels-association') ? 'labels-association' : null);
+    if (!assocStore) return [];
+    const assocs = await idbReadAll(db, assocStore);
+    const byJid = new Map(); // jid → Set(שמות תגיות)
+    for (const { value } of assocs) {
+      const v = value || {};
+      if (!want.has(String(v.labelId))) continue;
+      if (v.type && v.type !== 'jid') continue; // רק שיוך של צ'אט/איש קשר
+      const jid = v.associationId;
+      if (!jid || /@g\.us$/.test(jid)) continue; // קבוצות אינן לידים
+      if (!byJid.has(jid)) byJid.set(jid, new Set());
+      byJid.get(jid).add(nameById.get(String(v.labelId)) || String(v.labelId));
+    }
+    const rows = [];
+    for (const [jid, labelSet] of byJid) {
+      const c = (await idbGet(db, 'contact', jid)) || {};
+      const phone = waPhoneFromJid(c.phoneNumber) || waPhoneFromJid(jid) || '';
+      const name = firstNonEmpty(
+        c.name, c.formattedName, c.pushname, c.notifyName, c.shortName, c.verifiedName
+      );
+      rows.push({ phone, name, labels: [...labelSet].join(' | '), raw_id: jid });
+    }
+    return rows;
+  }
+
+  // בונה מחרוזת CSV. BOM של UTF-8 כדי ששמות בעברית ייפתחו נכון באקסל; שורות CRLF.
+  function csvEscape(val) {
+    const s = String(val == null ? '' : val);
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  function buildCsv(headers, rows) {
+    const BOM = '\uFEFF'; // U+FEFF — כדי ששמות בעברית ייפתחו נכון באקסל
+    const lines = [headers.map(csvEscape).join(',')];
+    for (const row of rows) lines.push(headers.map((h) => csvEscape(row[h])).join(','));
+    return BOM + lines.join('\r\n') + '\r\n';
+  }
+
+  // הורדת קובץ מקומי דרך Blob — עובד תחת @grant none (אין צורך ב-GM_download).
+  function downloadCsv(filename, csvText) {
+    const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   const randDelay = () =>
@@ -286,145 +364,89 @@
   // ──────────────────────── שליפת לידים (READ-ONLY) ───────────────────────
   // מחזיר מערך של { phone, name, wid, labels } עבור הצ'אטים שתחת התגיות הנבחרות.
   // labelsOverride (אופציונלי) — מערך [{id,name}] לתצוגה מקדימה לפני שמירה; ברירת מחדל cfg.selectedLabels.
-  async function collectLeads(WPP, labelsOverride) {
+  async function collectLeads(labelsOverride) {
     const selected = labelsOverride || cfg.selectedLabels;
     if (!selected || selected.length === 0) {
       throw new Error('לא נבחרו תגיות. פתח "הגדרות" וסמן לפחות תגית אחת.');
     }
 
-    // 1) שולפים את כל התגיות הקיימות ובונים מפה id→name.
-    const allLabels = (await WPP.labels.getAllLabels()) || [];
-    const idToName = new Map();
-    const nameToId = new Map();
-    for (const l of allLabels) {
-      idToName.set(String(l.id), String(l.name));
-      nameToId.set(String(l.name).trim(), String(l.id));
-    }
+    let db;
+    try {
+      db = await openWaModelDb();
+      const allLabels = await readIdbLabels(db);
+      const nameById = new Map(allLabels.map((l) => [l.id, l.name]));
 
-    // פותרים את ה-ids הנבחרים: מעדיפים id קיים, אחרת מתאימים לפי שם (מיגרציה).
-    const selectedIds = new Set();
-    for (const sel of selected) {
-      const byId = sel.id != null && idToName.has(String(sel.id)) ? String(sel.id) : null;
-      const byName = !byId && sel.name ? nameToId.get(String(sel.name).trim()) : null;
-      if (byId) selectedIds.add(byId);
-      else if (byName) selectedIds.add(byName);
-    }
-    if (selectedIds.size === 0) {
-      throw new Error('התגיות שנבחרו לא נמצאו בחשבון. פתח "הגדרות" ובחר מחדש.');
-    }
-
-    // 2) שולפים את כל הצ'אטים ומסננים לפי חברות באחת מהתגיות הנבחרות (READ).
-    const chats = await WPP.chat.list();
-
-    const byPhone = new Map(); // dedup: צ'אט תחת כמה תגיות נבחרות → ליד אחד.
-    for (const chat of chats || []) {
-      const matchedIds = [...selectedIds].filter((id) => chatHasLabel(chat, id));
-      if (matchedIds.length === 0) continue;
-
-      // טלפון מה-WID: כבר בפורמט בינלאומי קנוני (למשל 972501234567@c.us).
-      // מוסיפים + בלבד — בלי נירמול ידני.
-      const wid = chat.id;
-      const user = wid && wid.user ? String(wid.user) : '';
-      if (!user) continue;
-
-      // מדלגים על קבוצות (WID של קבוצה אינו טלפון של ליד).
-      const server = wid && wid.server ? String(wid.server) : '';
-      if (server === 'g.us') continue;
-
-      const phone = '+' + user;
-      const matchedNames = matchedIds.map((id) => idToName.get(id)).filter(Boolean);
-      if (byPhone.has(phone)) {
-        // צ'אט/טלפון שכבר נראה — מאחדים את שמות התגיות.
-        const existing = byPhone.get(phone);
-        for (const n of matchedNames) {
-          if (!existing.labels.includes(n)) existing.labels.push(n);
+      const labelIds = [];
+      for (const sel of selected) {
+        if (sel.id != null) {
+          labelIds.push(String(sel.id));
+        } else if (sel.name) {
+          const found = allLabels.find((l) => String(l.name).trim() === String(sel.name).trim());
+          if (found) labelIds.push(String(found.id));
         }
-      } else {
-        byPhone.set(phone, {
-          phone,
-          wid: user + '@' + (server || 'c.us'),
-          name: chat.name || chat.formattedTitle || '',
-          labels: matchedNames,
-        });
       }
+
+      if (labelIds.length === 0) throw new Error('התגיות שנבחרו לא נמצאו (IDB).');
+
+      const rows = await collectLabeledLeads(db, labelIds, nameById);
+      return rows.filter((r) => r.phone).map((r) => ({
+        phone: r.phone,
+        wid: r.raw_id,
+        name: r.name,
+        labels: r.labels ? r.labels.split(' | ') : []
+      }));
+    } finally {
+      if (db) { try { db.close(); } catch (e) { } }
     }
-
-    return [...byPhone.values()];
-  }
-
-  // ⚠️ TODO: אמת מול גרסת wa-js שלך איפה יושבות תגיות הצ'אט — ראה Step 0 ב-README.
-  // הדרך שבה כל chat מחזיק את התגיות שלו משתנה בין גרסאות wa-js.
-  // נכון לגרסה היציבה (v4.3.0) הצ'אט בדרך כלל חושף מערך labels של מזהי תגיות,
-  // אך ייתכן מבנה שונה (chat.labels כאובייקטים / chat.t / שדה אחר).
-  // אם השליפה מחזירה 0 לידים — הרץ את Step 0 בקונסול והתאם את הפונקציה הזו.
-  function chatHasLabel(chat, labelId) {
-    if (!chat) return false;
-    const raw = chat.labels;
-    if (!raw) return false;
-
-    // מנרמלים לכמה צורות אפשריות: מערך מזהים, מערך אובייקטים, או Map/אוסף.
-    let list = raw;
-    if (typeof raw.getModelsArray === 'function') list = raw.getModelsArray();
-    else if (!Array.isArray(raw) && typeof raw === 'object') list = Object.values(raw);
-
-    if (!Array.isArray(list)) return false;
-
-    return list.some((item) => {
-      if (item == null) return false;
-      if (typeof item === 'string' || typeof item === 'number') {
-        return String(item) === labelId;
-      }
-      if (typeof item === 'object') {
-        const id = item.id != null ? item.id : item.labelId;
-        return String(id) === labelId;
-      }
-      return false;
-    });
   }
 
   // ───────────────────────────── שליחה ל-CRM ──────────────────────────────
   // אבטחה:
   //  • HTTPS בלבד (הטלפון מוצפן בתעבורה).
-  //  • אימות דרך חתימת HMAC-SHA256 על (timestamp + "." + body) — הסוד עצמו
-  //    אף פעם לא נשלח ברשת, רק החתימה. החותמת מאפשרת לשרת לדחות replay (חלון ~5 דק').
+  //  • אימות דרך x-api-key — הסוד המשותף נשלח בכותרת ישירות.
+  //  • GM_xmlhttpRequest עוקף את CSP של WhatsApp Web (שחוסם fetch לדומיינים חיצוניים).
   //  • לא מתעדים את גוף התשובה (responseText) — הוא עלול להחזיר את הטלפון.
-  async function postLead(lead) {
+  function postLead(lead) {
     const url = cfg.webhookUrl;
+    console.log('[Leads Sync] POST →', url);
     if (!/^https:\/\//i.test(url)) {
-      throw new Error('ה-Webhook חייב להיות HTTPS (כדי שהטלפון יישלח מוצפן).');
+      return Promise.reject(new Error('ה-Webhook חייב להיות HTTPS (כדי שהטלפון יישלח מוצפן).'));
     }
 
     const body = JSON.stringify({
       phone: lead.phone,
-      name: lead.name,
-      labels: lead.labels || [], // שמות התגיות שמהן הגיע הליד
-      source: 'whatsapp-web',
-      synced_at: new Date().toISOString(),
+      name: lead.name || '',
+      labels: lead.labels || [],
+      source: 'whatsapp',
+      labeledAt: new Date().toISOString(),
     });
-    const timestamp = String(Math.floor(Date.now() / 1000)); // שניות מאז epoch
-    const signature = await hmacSignHex(cfg.sharedSecret, timestamp + '.' + body);
 
-    // תחת @grant none שולחים ב-fetch רגיל → ה-endpoint ב-Base44 חייב להחזיר כותרות
-    // CORS (כולל מענה ל-OPTIONS preflight). ראה docs/base44-endpoint.md.
-    let res;
-    try {
-      res = await fetch(url, {
+    // GM_xmlhttpRequest עוקף CSP לחלוטין — WhatsApp Web חוסם fetch לדומיינים
+    // שלא ב-connect-src (כולל base44.app). זו הסיבה שעברנו מ-@grant none.
+    // הדומיין חייב להופיע ב-@connect (host בלבד) אחרת Tampermonkey יחסום.
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
         method: 'POST',
+        url: url,
         headers: {
           'Content-Type': 'application/json',
-          'X-Timestamp': timestamp,
-          'X-Signature': signature, // hex של HMAC-SHA256 — הסוד עצמו לא נשלח
+          'x-api-key': cfg.sharedSecret,
         },
-        body,
-        mode: 'cors',
-        credentials: 'omit',
+        data: body,
+        onload: function (resp) {
+          if (resp.status >= 200 && resp.status < 300) {
+            resolve({ status: resp.status });
+          } else {
+            // מדפיסים את גוף התשובה לדיבוג (ללא טלפון — רק הודעת השרת).
+            console.warn('[Leads Sync] HTTP', resp.status, '— response:', resp.responseText);
+            reject(new Error('HTTP ' + resp.status));
+          }
+        },
+        onerror: function () {
+          reject(new Error('שגיאת רשת בשליחה — ודא שה-URL תקין וש-Base44 זמין.'));
+        },
       });
-    } catch (e) {
-      throw new Error('שגיאת רשת/CORS בשליחה — ודא שה-endpoint ב-Base44 מאשר CORS.');
-    }
-    // לא קוראים את גוף התשובה — רק קוד הסטטוס, כדי לא להדליף PII ללוג/קונסול.
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    return { status: res.status };
+    });
   }
 
   // ─────────────────────────── זרימת הסנכרון ─────────────────────────────
@@ -449,15 +471,13 @@
         return;
       }
 
-      ui.status('טוען את WhatsApp…', 'info');
-      const WPP = await waitForWPP();
-      ui.status('קורא לידים מהתגיות…', 'info');
-      const leads = await collectLeads(WPP);
+      ui.status('קורא לידים מהתגיות (מ-IndexedDB)…', 'info');
+      const leads = await collectLeads();
 
       // אין dedup מקומי — לא שומרים כלום על המכשיר. ה-dedup הסופי הוא ה-upsert
       // בשרת (לפי טלפון), כך שאפשר לשלוח את אותו ליד שוב בלי ליצור כפילות.
       if (leads.length === 0) {
-        ui.status('לא נמצאו צ\'אטים תחת התגיות שנבחרו.', 'warn');
+        ui.status("לא נמצאו צ'אטים תחת התגיות שנבחרו.", 'warn');
         return;
       }
 
@@ -516,8 +536,12 @@
   // ───────────────────────────── ממשק (GUI) ──────────────────────────────
   // פאנל צף משלנו בתוך Shadow DOM — מבודד לחלוטין מה-CSS של WhatsApp, RTL מלא,
   // ולא נוגע ב-DOM של WhatsApp (יציב לאורך זמן, משטח זיהוי מינימלי).
-  const WA_GREEN = '#00a884';
-  const WA_DARK = '#075E54';
+  const WA_GOLD = '#d4af37';
+  const WA_GOLD_DIM = 'rgba(212,175,55,0.1)';
+  const PANEL_BG = '#1a1a1a';
+  const TEXT_PRIMARY = '#ffffff';
+  const TEXT_SECONDARY = '#a0a0a0';
+  const BORDER_COLOR = '#333333';
 
   const UI_CSS = `
     :host { all: initial; }
@@ -525,112 +549,195 @@
     .launcher {
       position: fixed; bottom: 22px; inset-inline-start: 22px; z-index: 2147483646;
       width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer;
-      background: ${WA_GREEN}; color: #fff; font-size: 24px; line-height: 1;
-      box-shadow: 0 4px 14px rgba(0,0,0,.35); transition: transform .12s ease;
+      background: ${WA_GOLD}; color: #111; font-size: 24px; line-height: 1;
+      box-shadow: 0 4px 14px rgba(0,0,0,.5); transition: transform .12s ease;
     }
     .launcher:hover { transform: scale(1.06); }
     .panel {
       position: fixed; bottom: 90px; inset-inline-start: 22px; z-index: 2147483647;
-      width: 320px; max-height: 78vh; overflow-y: auto; direction: rtl;
-      background: #fff; color: #111b21; border-radius: 14px;
-      box-shadow: 0 10px 40px rgba(0,0,0,.32); border: 1px solid #e9edef;
+      width: 360px; max-height: 85vh; overflow-y: auto; direction: rtl;
+      background: ${PANEL_BG}; color: ${TEXT_PRIMARY}; border-radius: 12px;
+      box-shadow: 0 10px 40px rgba(0,0,0,.6); border: 1px solid ${BORDER_COLOR};
+      display: flex; flex-direction: column;
     }
     .panel[hidden] { display: none; }
+    
+    /* Scrollbar */
+    .panel::-webkit-scrollbar { width: 6px; }
+    .panel::-webkit-scrollbar-track { background: transparent; }
+    .panel::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+
     .hdr {
       display: flex; align-items: center; justify-content: space-between;
-      background: ${WA_DARK}; color: #fff; padding: 12px 14px;
-      border-radius: 14px 14px 0 0;
+      padding: 16px 20px 12px;
     }
-    .hdr .title { font-weight: 700; font-size: 15px; }
-    .hdr .x { background: none; border: none; color: #fff; font-size: 18px; cursor: pointer; padding: 2px 6px; }
-    .body { padding: 14px; }
-    .badges { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
-    .badge { font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 20px; }
-    .badge.ok { background: #d9fdd3; color: #0a6b2e; }
-    .badge.warn { background: #fff3cd; color: #8a6100; }
-    .badge.err { background: #fde2e1; color: #b02a24; }
-    button.primary {
-      width: 100%; padding: 11px; border: none; border-radius: 10px; cursor: pointer;
-      background: ${WA_GREEN}; color: #fff; font-size: 15px; font-weight: 700;
+    .hdr .title-wrap { display: flex; align-items: center; gap: 8px; color: ${WA_GOLD}; }
+    .hdr .title { font-weight: 800; font-size: 20px; letter-spacing: 1px; }
+    .hdr .icon { width: 20px; height: 20px; fill: currentColor; }
+    .hdr .x { background: none; border: none; color: #555; font-size: 20px; cursor: pointer; padding: 0; transition: color .2s; }
+    .hdr .x:hover { color: #fff; }
+
+    .badges { display: flex; gap: 10px; padding: 0 20px; justify-content: center; margin-bottom: 16px; }
+    .badge { font-size: 11px; font-weight: 700; padding: 4px 12px; border-radius: 20px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .badge.ok { border: 1px solid ${WA_GOLD}; color: ${WA_GOLD}; background: ${WA_GOLD_DIM}; }
+    .badge.warn { background: ${WA_GOLD}; color: #111; }
+    .badge.err { border: 1px solid #ff4a4a; color: #ff4a4a; background: rgba(255, 74, 74, 0.1); }
+
+    .subtitle { text-align: center; font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #eaeaea; }
+
+    .actions-grid {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 0 20px; margin-bottom: 20px;
     }
-    button.primary:disabled { opacity: .55; cursor: default; }
-    .toggle { display: flex; align-items: center; gap: 8px; margin: 12px 0; font-size: 14px; cursor: pointer; }
-    .actions { display: flex; gap: 8px; margin-top: 4px; }
-    button.ghost {
-      flex: 1; padding: 8px; border: 1px solid #d1d7db; border-radius: 8px; cursor: pointer;
-      background: #f7f8fa; color: #111b21; font-size: 13px; font-weight: 600;
+    .action-btn {
+      background: transparent; border: 1px solid ${BORDER_COLOR}; border-radius: 8px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 12px 4px; gap: 8px; cursor: pointer; color: ${TEXT_SECONDARY}; transition: all .2s;
     }
-    .settings { margin-top: 12px; border-top: 1px solid #eef1f3; padding-top: 12px; }
+    .action-btn:hover { background: rgba(255,255,255,0.03); color: ${WA_GOLD}; border-color: #444; }
+    .action-btn svg { width: 20px; height: 20px; fill: ${WA_GOLD}; }
+    .action-btn span { font-size: 11px; font-weight: 600; }
+
+    .table-container { border-top: 1px solid ${BORDER_COLOR}; border-bottom: 1px solid ${BORDER_COLOR}; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: start; padding: 12px 20px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+    th { color: ${TEXT_SECONDARY}; font-weight: 600; font-size: 12px; }
+    tr:last-child td { border-bottom: none; }
+    td.num { color: ${WA_GOLD}; font-weight: 700; width: 40px; }
+    td.ph { direction: ltr; text-align: right; color: #e0e0e0; font-variant-numeric: tabular-nums; }
+    td.name { color: #fff; }
+
+    .settings { padding: 20px; border-top: 1px solid ${BORDER_COLOR}; background: rgba(0,0,0,0.2); }
     .settings[hidden] { display: none; }
-    .settings label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 10px; color: #54656f; }
+    .settings label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 12px; color: ${TEXT_SECONDARY}; }
     .settings input {
-      width: 100%; margin-top: 4px; padding: 8px; border: 1px solid #d1d7db;
-      border-radius: 8px; font-size: 13px; direction: ltr; text-align: start;
+      width: 100%; margin-top: 6px; padding: 10px 12px; border: 1px solid ${BORDER_COLOR};
+      border-radius: 8px; font-size: 14px; direction: ltr; text-align: start;
+      background: #111; color: #fff; outline: none; transition: border-color .2s;
     }
-    .settings-actions { display: flex; gap: 8px; }
-    button.small { padding: 8px; font-size: 13px; }
-    .lbl-head { display: flex; align-items: center; justify-content: space-between; }
-    .lbl-head .link { background: none; border: none; color: ${WA_GREEN}; cursor: pointer; font-size: 12px; font-weight: 600; padding: 0; }
-    .lbl-list { max-height: 160px; overflow-y: auto; border: 1px solid #d1d7db; border-radius: 8px; padding: 6px 8px; margin-top: 4px; }
-    .lbl-row { display: flex; align-items: center; gap: 8px; padding: 5px 2px; font-weight: 500; color: #111b21; cursor: pointer; }
-    .lbl-row input { width: auto; margin: 0; }
-    .lbl-dot { width: 11px; height: 11px; border-radius: 50%; flex: 0 0 auto; border: 1px solid rgba(0,0,0,.15); }
-    .lbl-muted { color: #8696a0; font-size: 12px; padding: 6px 2px; }
-    .lbl-count { font-size: 12px; color: #54656f; margin-top: 6px; font-weight: 600; }
-    button.ghost.preview { margin-top: 8px; }
-    button.danger { border: 1px solid #f1b0ad; background: #fff; color: #b02a24; border-radius: 8px; cursor: pointer; font-weight: 600; flex: 1; }
-    .status { margin-top: 12px; font-size: 13px; min-height: 18px; line-height: 1.4; }
-    .status.info { color: #54656f; }
-    .status.success { color: #0a6b2e; }
-    .status.warn { color: #8a6100; }
-    .status.error { color: #b02a24; }
-    .results { margin-top: 10px; }
-    table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    th, td { text-align: start; padding: 6px 8px; border-bottom: 1px solid #eef1f3; }
-    th { color: #54656f; font-weight: 700; }
-    td.ph { direction: ltr; text-align: start; font-variant-numeric: tabular-nums; }
-    .foot { margin-top: 12px; font-size: 11px; color: #8696a0; text-align: center; }
+    .settings input:focus { border-color: ${WA_GOLD}; }
+    .lbl-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    .lbl-head .link { background: none; border: none; color: ${WA_GOLD}; cursor: pointer; font-size: 12px; font-weight: 600; padding: 0; }
+    .lbl-list { max-height: 160px; overflow-y: auto; border: 1px solid ${BORDER_COLOR}; background: #111; border-radius: 8px; padding: 6px; }
+    .lbl-list::-webkit-scrollbar { width: 4px; }
+    .lbl-list::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+    .lbl-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; font-weight: 500; color: #ddd; cursor: pointer; border-radius: 6px; transition: background 0.15s; margin-bottom: 2px; }
+    .lbl-row:hover { background: rgba(255,255,255,0.05); }
+    .lbl-row input { display: none; }
+    .custom-cb { width: 18px; height: 18px; border: 2px solid #555; border-radius: 4px; display: flex; align-items: center; justify-content: center; transition: all 0.2s; flex: 0 0 auto; }
+    .lbl-row input:checked ~ .custom-cb { background: ${WA_GOLD}; border-color: ${WA_GOLD}; }
+    .custom-cb::after { content: ''; width: 4px; height: 8px; border: solid #111; border-width: 0 2px 2px 0; transform: rotate(45deg); opacity: 0; transition: opacity 0.2s; margin-bottom: 2px; }
+    .lbl-row input:checked ~ .custom-cb::after { opacity: 1; }
+    .lbl-dot { width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto; border: 1px solid rgba(255,255,255,.1); }
+    .lbl-text { flex: 1; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .lbl-muted { color: #555; font-size: 12px; padding: 6px 4px; }
+    .lbl-count { font-size: 12px; color: ${WA_GOLD}; margin-top: 8px; font-weight: 600; }
+    .settings-actions { display: flex; gap: 10px; margin-top: 16px; }
+    button.small { padding: 10px; font-size: 13px; flex: 1; border-radius: 8px; cursor: pointer; font-weight: 600; border: none; }
+    button.small.primary { background: ${WA_GOLD_DIM}; color: ${WA_GOLD}; border: 1px solid ${WA_GOLD}; }
+    button.small.danger { background: rgba(255,74,74,0.1); color: #ff4a4a; border: 1px solid #ff4a4a; }
+    
+    .status-area { padding: 20px; }
+    .status { font-size: 13px; line-height: 1.4; text-align: center; margin-bottom: 16px; }
+    .status.info { color: ${TEXT_SECONDARY}; }
+    .status.success { color: ${WA_GOLD}; }
+    .status.warn { color: #ffc107; }
+    .status.error { color: #ff4a4a; }
+
+    button.primary.huge {
+      width: 100%; padding: 16px; border: none; border-radius: 8px; cursor: pointer;
+      background: ${WA_GOLD}; color: #111; font-size: 16px; font-weight: 700;
+      display: flex; align-items: center; justify-content: center; gap: 10px;
+      transition: background 0.2s;
+    }
+    button.primary.huge:hover { background: #f5c85b; }
+    button.primary.huge:disabled { opacity: .55; cursor: not-allowed; }
+    button.primary.huge svg { width: 20px; height: 20px; fill: currentColor; }
+
+    .foot { margin: 16px 0 0; font-size: 11px; color: #555; text-align: center; }
+    
+    .toggle { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 0 0 16px 0; font-size: 13px; cursor: pointer; color: ${TEXT_SECONDARY}; }
+    .toggle input { accent-color: ${WA_GOLD}; width: 16px; height: 16px; }
   `;
+
+  // SVGs for icons
+  const ICONS = {
+    globe: '<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>',
+    settings: '<svg viewBox="0 0 24 24"><path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.06-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.73,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.06,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.43-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.49-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/></svg>',
+    preview: '<svg viewBox="0 0 24 24"><path d="M12,4.5C7,4.5,2.73,7.61,1,12c1.73,4.39,6,7.5,11,7.5s9.27-3.11,11-7.5C21.27,7.61,17,4.5,12,4.5z M12,17 c-2.76,0-5-2.24-5-5s2.24-5,5-5s5,2.24,5,5S14.76,17,12,17z M12,9c-1.66,0-3,1.34-3,3s1.34,3,3,3s3-1.34,3-3S13.66,9,12,9z"/></svg>',
+    csv: '<svg viewBox="0 0 24 24"><path d="M14,2H6C4.9,2,4,2.9,4,4v16c0,1.1,0.89,2,1.99,2H18c1.1,0,2-0.9,2-2V8L14,2z M16,18H8v-2h8V18z M16,14H8v-2h8V14z M13,9V3.5L18.5,9H13z"/></svg>',
+    test: '<svg viewBox="0 0 24 24"><path d="M20,4H4C2.9,4,2,4.9,2,6v12c0,1.1,0.9,2,2,2h16c1.1,0,2-0.9,2-2V6C22,4.9,21.1,4,20,4z M20,18H4V6h16V18z M18,10l-1.41-1.41 L10,15.17l-3.59-3.59L5,13l5,5L18,10z"/></svg>',
+    send: '<svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>'
+  };
 
   const UI_HTML = `
     <button class="launcher" id="wals-launch" title="סנכרון לידים" aria-label="סנכרון לידים">↗</button>
     <div class="panel" id="wals-panel" hidden>
       <div class="hdr">
-        <span class="title">סנכרון לידים</span>
         <button class="x" id="wals-close" title="סגור" aria-label="סגור">✕</button>
+        <div class="title-wrap">
+          <span class="title">BASE44</span>
+          <span class="icon">${ICONS.globe}</span>
+        </div>
       </div>
-      <div class="body">
-        <div class="badges">
-          <span class="badge" id="wals-conn"></span>
-          <span class="badge" id="wals-mode"></span>
+      
+      <div class="badges">
+        <span class="badge" id="wals-conn"></span>
+        <span class="badge" id="wals-mode"></span>
+      </div>
+
+      <div class="subtitle">סנכרון נמענים ל-CRM</div>
+
+      <div class="actions-grid">
+        <button class="action-btn" id="wals-settings-btn" title="הגדרות">
+          ${ICONS.settings}
+          <span>הגדרות</span>
+        </button>
+        <button class="action-btn" id="wals-preview" title="תצוגה מקדימה">
+          ${ICONS.preview}
+          <span>תצוגה</span>
+        </button>
+        <button class="action-btn" id="wals-step0" title="בדיקת תגיות">
+          ${ICONS.test}
+          <span>בדיקה</span>
+        </button>
+        <button class="action-btn" id="wals-export" title="ייצוא לידים מתויגים ל-CSV">
+          ${ICONS.csv}
+          <span>אקסל</span>
+        </button>
+      </div>
+
+      <div class="table-container">
+        <div class="results" id="wals-results">
+          <!-- טבלת תוצאות תוזרק לכאן -->
         </div>
-        <button class="primary" id="wals-sync">סנכרן לידים</button>
+      </div>
+
+      <div class="settings" id="wals-settings" hidden>
+        <label>כתובת Webhook (HTTPS)
+          <input type="url" id="wals-url" placeholder="https://...base44.app/...">
+        </label>
+        <label>סוד משותף (לחתימת HMAC)
+          <input type="password" id="wals-secret" placeholder="••••••••">
+        </label>
+        <div class="lbl-head" style="margin-top:12px;">
+          <label style="margin-bottom:0">תגיות לסנכרון (בחירה מרובה)</label>
+          <button class="link" id="wals-labels-reload">רענן</button>
+        </div>
+        <div class="lbl-list" id="wals-labels"><div class="lbl-muted">פתח כדי לטעון תגיות…</div></div>
+        <div class="lbl-count" id="wals-labels-count"></div>
+        <div class="settings-actions">
+          <button class="primary small" id="wals-save">שמור</button>
+          <button class="danger small" id="wals-clear">מחק</button>
+        </div>
+      </div>
+
+      <div class="status-area">
+        <div class="status info" id="wals-status">מוכן לסנכרון.</div>
         <label class="toggle"><input type="checkbox" id="wals-dry"> מצב DRY_RUN (לא שולח, רק מציג)</label>
-        <div class="actions">
-          <button class="ghost" id="wals-step0">בדיקת תגיות</button>
-          <button class="ghost" id="wals-settings-btn">הגדרות</button>
-        </div>
-        <div class="settings" id="wals-settings" hidden>
-          <label>כתובת Webhook (HTTPS)
-            <input type="url" id="wals-url" placeholder="https://...base44.app/...">
-          </label>
-          <label>סוד משותף (לחתימת HMAC)
-            <input type="password" id="wals-secret" placeholder="••••••••">
-          </label>
-          <div class="lbl-head">
-            <label style="margin-bottom:4px">תגיות לסנכרון (בחירה מרובה)</label>
-            <button class="link" id="wals-labels-reload">רענן</button>
-          </div>
-          <div class="lbl-list" id="wals-labels"><div class="lbl-muted">פתח כדי לטעון תגיות…</div></div>
-          <div class="lbl-count" id="wals-labels-count"></div>
-          <button class="ghost preview" id="wals-preview">תצוגה מקדימה</button>
-          <div class="settings-actions" style="margin-top:10px">
-            <button class="primary small" id="wals-save">שמור</button>
-            <button class="danger small" id="wals-clear">מחק נתונים</button>
-          </div>
-        </div>
-        <div class="status info" id="wals-status"></div>
-        <div class="results" id="wals-results"></div>
+        <button class="primary huge" id="wals-sync">
+          התחל שליחה
+          ${ICONS.send}
+        </button>
         <div class="foot">READ-ONLY · סנכרון בלחיצה בלבד</div>
       </div>
     </div>
@@ -662,6 +769,7 @@
         launch: $('wals-launch'), panel: $('wals-panel'), close: $('wals-close'),
         conn: $('wals-conn'), mode: $('wals-mode'), sync: $('wals-sync'),
         dry: $('wals-dry'), step0: $('wals-step0'), settingsBtn: $('wals-settings-btn'),
+        export: $('wals-export'),
         settings: $('wals-settings'), url: $('wals-url'), secret: $('wals-secret'),
         labels: $('wals-labels'), labelsCount: $('wals-labels-count'),
         labelsReload: $('wals-labels-reload'), preview: $('wals-preview'),
@@ -674,6 +782,7 @@
       r.close.addEventListener('click', () => this.close());
       r.sync.addEventListener('click', syncLeads);
       r.step0.addEventListener('click', runLabelDiagnostics);
+      r.export.addEventListener('click', () => this.exportContactsCsv());
       r.settingsBtn.addEventListener('click', () => this.showSettings());
       r.labelsReload.addEventListener('click', () => this.loadLabels(true));
       r.preview.addEventListener('click', () => this.previewLeads());
@@ -706,48 +815,54 @@
       if (this._labelsLoaded && !force) return;
       const box = this.refs.labels;
       box.innerHTML = '<div class="lbl-muted">טוען תגיות…</div>';
+
+      let labels = [];
+      let db;
       try {
-        const WPP = await waitForWPP();
-        const labels = (await WPP.labels.getAllLabels()) || [];
-        if (labels.length === 0) {
-          box.innerHTML = '<div class="lbl-muted">לא נמצאו תגיות בחשבון.</div>';
-          this._labelsLoaded = true;
-          return;
-        }
-        // אילו מסומנות לפי מה ששמור (התאמה לפי id או שם).
-        const selected = cfg.selectedLabels;
-        const isSel = (l) =>
-          selected.some(
-            (s) =>
-              (s.id != null && String(s.id) === String(l.id)) ||
-              (s.name && String(s.name).trim() === String(l.name).trim())
-          );
-        box.innerHTML = labels
-          .map((l) => {
-            const color = labelColor(l);
-            const dot = color
-              ? '<span class="lbl-dot" style="background:' + color + '"></span>'
-              : '<span class="lbl-dot" style="background:#ccc"></span>';
-            return (
-              '<label class="lbl-row">' +
-              '<input type="checkbox" data-id="' + escapeHtml(l.id) +
-              '" data-name="' + escapeHtml(l.name) + '"' + (isSel(l) ? ' checked' : '') + '>' +
-              dot +
-              '<span>' + escapeHtml(l.name) + '</span>' +
-              '</label>'
-            );
-          })
-          .join('');
-        box.querySelectorAll('input[type=checkbox]').forEach((cb) =>
-          cb.addEventListener('change', () => this.updateLabelsCount())
-        );
-        this._labelsLoaded = true;
-        this.updateLabelsCount();
+        db = await openWaModelDb();
+        labels = await readIdbLabels(db);
       } catch (e) {
-        box.innerHTML =
-          '<div class="lbl-muted">לא ניתן לטעון תגיות — ודא ש-WhatsApp נטען, ולחץ "רענן".</div>';
-        console.warn('[Leads Sync] loadLabels:', e);
+        console.warn('[Leads Sync] loadLabels (IndexedDB) שגיאה:', e && e.message);
+      } finally {
+        if (db) { try { db.close(); } catch (e) { } }
       }
+
+      if (labels.length === 0) {
+        box.innerHTML = '<div class="lbl-muted">לא נמצאו תגיות (ב-IndexedDB).</div>';
+        this._labelsLoaded = true;
+        return;
+      }
+
+      // אילו מסומנות לפי מה ששמור (התאמה לפי id או שם).
+      const selected = cfg.selectedLabels;
+      const isSel = (l) =>
+        selected.some(
+          (s) =>
+            (s.id != null && String(s.id) === String(l.id)) ||
+            (s.name && String(s.name).trim() === String(l.name).trim())
+        );
+      box.innerHTML = labels
+        .map((l) => {
+          const color = labelColor(l);
+          const dot = color
+            ? '<span class="lbl-dot" style="background:' + color + '"></span>'
+            : '<span class="lbl-dot" style="background:#ccc"></span>';
+          return (
+            '<label class="lbl-row">' +
+            '<input type="checkbox" data-id="' + escapeHtml(l.id) +
+            '" data-name="' + escapeHtml(l.name) + '"' + (isSel(l) ? ' checked' : '') + '>' +
+            '<div class="custom-cb"></div>' +
+            dot +
+            '<span class="lbl-text">' + escapeHtml(l.name) + '</span>' +
+            '</label>'
+          );
+        })
+        .join('');
+      box.querySelectorAll('input[type=checkbox]').forEach((cb) =>
+        cb.addEventListener('change', () => this.updateLabelsCount())
+      );
+      this._labelsLoaded = true;
+      this.updateLabelsCount();
     },
 
     getCheckedLabels() {
@@ -773,8 +888,7 @@
       this.clearResults();
       this.status('טוען תצוגה מקדימה…', 'info');
       try {
-        const WPP = await waitForWPP();
-        const leads = await collectLeads(WPP, checked);
+        const leads = await collectLeads(checked);
         if (leads.length === 0) {
           this.status('אין צ\'אטים תחת התגיות שנבחרו.', 'warn');
           return;
@@ -786,10 +900,59 @@
       }
     },
 
+    // ייצוא לידים מתויגים ל-CSV מקומי, ישירות מ-IndexedDB (ללא wa-js, ללא webhook).
+    // דורש בחירת תגיות מראש (ב"הגדרות"). הקובץ מכיל טלפונים מלאים (חריגה מודעת);
+    // הפאנל והקונסול מציגים ממוסך בלבד.
+    async exportContactsCsv() {
+      this.clearResults();
+
+      // 1) חייבים תגיות נבחרות. אם אין — פותחים הגדרות, טוענים תגיות, ומבקשים לבחור.
+      const checked = this.getCheckedLabels();
+      if (checked.length === 0) {
+        this.showSettings(true);
+        await this.loadLabels();
+        this.status('בחר קודם לפחות תגית אחת (ב"הגדרות"), ואז לחץ שוב על "ייצוא אנשי קשר ל-CSV".', 'warn');
+        return;
+      }
+
+      this.status('קורא לידים מתויגים מ-IndexedDB…', 'info');
+      let db;
+      try {
+        db = await openWaModelDb();
+        const allLabels = await readIdbLabels(db);
+        const nameById = new Map(allLabels.map((l) => [l.id, l.name]));
+        const labelIds = checked.map((c) => c.id).filter((x) => x != null);
+        const rows = await collectLabeledLeads(db, labelIds, nameById);
+
+        if (rows.length === 0) {
+          this.status('לא נמצאו אנשי קשר תחת התגיות שנבחרו (ייתכן שרק קבוצות, או שאין שיוכים).', 'warn');
+          return;
+        }
+
+        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+        const headers = ['phone', 'name', 'labels', 'raw_id'];
+        downloadCsv('whatsapp-leads-' + stamp + '.csv', buildCsv(headers, rows));
+
+        // תצוגה בפאנל — טלפונים ממוסכים בלבד (הקובץ מכיל מלא, הפאנל לא חושף).
+        const withPhone = rows.filter((r) => r.phone).length;
+        this.showLeadsTable(rows.slice(0, 50).map((r) => ({ phone: maskPhone(r.phone), name: r.name })));
+        this.status(
+          'הורד CSV עם ' + rows.length + ' לידים (' + withPhone + ' עם טלפון). מוצגים עד 50, טלפונים ממוסכים בפאנל.',
+          'success'
+        );
+        console.log('[Leads Sync] CSV יוצא:', rows.length, 'לידים (טלפונים מלאים בקובץ בלבד).');
+      } catch (e) {
+        console.error('[Leads Sync] exportContactsCsv:', e);
+        this.status('שגיאה בייצוא: ' + (e && e.message ? e.message : e), 'error');
+      } finally {
+        if (db) { try { db.close(); } catch (e) { } }
+      }
+    },
+
     setBusy(busy) {
       if (!this.built) return;
       this.refs.sync.disabled = busy;
-      this.refs.sync.textContent = busy ? 'מסנכרן…' : 'סנכרן לידים';
+      this.refs.sync.innerHTML = busy ? 'מסנכרן…' : 'התחל שליחה ' + ICONS.send;
     },
 
     status(text, type) {
@@ -804,12 +967,12 @@
       if (!this.built) return;
       const body = rows
         .map(
-          (x) =>
-            '<tr><td class="ph">' + escapeHtml(x.phone) + '</td><td>' + escapeHtml(x.name) + '</td></tr>'
+          (x, i) =>
+            '<tr><td class="num">' + (i + 1) + '</td><td class="ph">' + escapeHtml(x.phone) + '</td><td class="name">' + escapeHtml(x.name) + '</td></tr>'
         )
         .join('');
       this.refs.results.innerHTML =
-        '<table><thead><tr><th>טלפון (ממוסך)</th><th>שם</th></tr></thead><tbody>' +
+        '<table><thead><tr><th></th><th>מספר נייד</th><th>שם</th></tr></thead><tbody>' +
         body +
         '</tbody></table>';
     },
