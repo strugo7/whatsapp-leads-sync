@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.5.0
+// @version      1.5.1
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
 // @run-at       document-idle
-// @require      https://cdn.jsdelivr.net/npm/@wppconnect/wa-js@4.3.0/dist/wppconnect-wa.js
+// @require      https://cdn.jsdelivr.net/npm/@wppconnect/wa-js@4.3.2-alpha.0/dist/wppconnect-wa.js
 // @grant        none
 // @updateURL    https://raw.githubusercontent.com/strugo7/whatsapp-leads-sync/main/whatsapp-leads-sync.user.js
 // @downloadURL  https://raw.githubusercontent.com/strugo7/whatsapp-leads-sync/main/whatsapp-leads-sync.user.js
@@ -40,7 +40,7 @@
   'use strict';
 
   // לוג טעינה — אם השורה הזו לא מופיעה בקונסול, הסקריפט עצמו לא רץ (בד"כ @require נכשל).
-  console.log('%c[Leads Sync] v1.5.0 נטען', 'color:#00a884;font-weight:bold');
+  console.log('%c[Leads Sync] v1.5.1 נטען', 'color:#00a884;font-weight:bold');
 
   // ───────────────────────────── מפתחות אחסון ─────────────────────────────
   const STORE = {
