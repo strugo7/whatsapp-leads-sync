@@ -32,18 +32,35 @@ X-Signature: <hex של HMAC-SHA256(secret, "<X-Timestamp>.<גוף הבקשה ה�
 > `labels` הוא מערך שמות התגיות שמהן הגיע הליד (יכול להכיל יותר מאחת אם הצ'אט תויג
 > בכמה מהתגיות שנבחרו). השדה נחתם כחלק מה-body ב-HMAC, כמו שאר הגוף.
 
+## חובה: CORS
+
+הסקריפט רץ ב-`web.whatsapp.com` ושולח את הבקשה ב-`fetch` (הוא רץ עם `@grant none`).
+לכן **ה-endpoint חייב לאשר CORS**, אחרת הדפדפן יחסום את הבקשה:
+
+- **מענה ל-`OPTIONS` (preflight)** עם הכותרות:
+  ```
+  Access-Control-Allow-Origin: https://web.whatsapp.com
+  Access-Control-Allow-Methods: POST, OPTIONS
+  Access-Control-Allow-Headers: Content-Type, X-Timestamp, X-Signature
+  Access-Control-Max-Age: 86400
+  ```
+  (ה-preflight נשלח כי אנחנו מוסיפים כותרות `X-Timestamp`/`X-Signature`.)
+- **בתשובת ה-`POST`** להחזיר גם `Access-Control-Allow-Origin: https://web.whatsapp.com`.
+
 ## מה ה-endpoint צריך לעשות
 
-1. **לדחות אם לא HTTPS** ואם המתודה אינה POST.
-2. **בדיקת replay**: לוודא ש-`X-Timestamp` נמצא בחלון של ±5 דקות מהשעון של השרת.
+1. **לטפל ב-`OPTIONS`** (preflight) ולהחזיר את כותרות ה-CORS שלמעלה.
+2. **לדחות אם לא HTTPS** ואם המתודה אינה POST.
+3. **בדיקת replay**: לוודא ש-`X-Timestamp` נמצא בחלון של ±5 דקות מהשעון של השרת.
    אם לא → `401`. זה מונע שליחה חוזרת של בקשה שצותתה.
-3. **אימות חתימה**: לחשב `HMAC-SHA256(secret, X-Timestamp + "." + rawBody)` ולהשוות
+4. **אימות חתימה**: לחשב `HMAC-SHA256(secret, X-Timestamp + "." + rawBody)` ולהשוות
    ל-`X-Signature` בהשוואת **זמן-קבוע** (constant-time) כדי למנוע timing attacks.
    אם לא תואם → `401`.
    ⚠️ חשוב: לחתום על **גוף הבקשה הגולמי** (raw bytes) — לא על JSON ש-serialized מחדש,
    אחרת החתימה לא תתאים.
-4. **Upsert** לטבלת הלידים לפי `phone` (המקור היחיד לאמת לגבי כפילויות).
-5. להחזיר `200` בהצלחה — **בלי להחזיר נתוני לידים בגוף התשובה** (write-only).
+5. **Upsert** לטבלת הלידים לפי `phone` (המקור היחיד לאמת לגבי כפילויות).
+6. להחזיר `200` בהצלחה (עם כותרת `Access-Control-Allow-Origin`) — **בלי להחזיר נתוני
+   לידים בגוף התשובה** (write-only).
 
 ## דוגמת לוגיקה (פסאודו)
 
@@ -53,8 +70,16 @@ import crypto from 'node:crypto';
 
 const MAX_SKEW_SEC = 300; // ±5 דקות
 
+const CORS = {
+  'Access-Control-Allow-Origin': 'https://web.whatsapp.com',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Timestamp, X-Signature',
+};
+
 export default async function handler(req) {
-  if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+  // 0) preflight CORS
+  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
+  if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: CORS });
 
   // 1) קריאת הגוף הגולמי (לפני JSON.parse) — חובה לחתימה תקינה
   const rawBody = await req.text();
@@ -88,13 +113,16 @@ export default async function handler(req) {
     await Leads.create({ phone, name, labels, source, created_at: synced_at });
   }
 
-  // 5) write-only — לא מחזירים נתוני לידים
+  // 5) write-only — לא מחזירים נתוני לידים. כל תשובה (כולל 401/400) צריכה כותרות CORS.
   return new Response(JSON.stringify({ ok: true }), {
     status: 200,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...CORS },
   });
 }
 ```
+
+> שים לב: גם תשובות השגיאה (401/400) צריכות לכלול את כותרות ה-CORS, אחרת הדפדפן
+> "יבלע" את התשובה והסקריפט יראה שגיאת רשת גנרית במקום הקוד האמיתי.
 
 ## המלצות אבטחה נוספות (היכן שהדאטה באמת יושבת)
 

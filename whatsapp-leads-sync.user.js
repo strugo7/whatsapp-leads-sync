@@ -1,18 +1,13 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.4.1
+// @version      1.5.0
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
 // @run-at       document-idle
 // @require      https://cdn.jsdelivr.net/npm/@wppconnect/wa-js@4.3.0/dist/wppconnect-wa.js
-// @grant        GM_xmlhttpRequest
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        GM_deleteValue
-// @grant        GM_registerMenuCommand
-// @connect      base44.app
+// @grant        none
 // @updateURL    https://raw.githubusercontent.com/strugo7/whatsapp-leads-sync/main/whatsapp-leads-sync.user.js
 // @downloadURL  https://raw.githubusercontent.com/strugo7/whatsapp-leads-sync/main/whatsapp-leads-sync.user.js
 // ==/UserScript==
@@ -29,10 +24,14 @@
  *      רק קריאות: WPP.labels.getAllLabels() ו-WPP.chat.list(). זה מה ששומר
  *      על המספר של החבר מחסימה.
  *    • ריצה לפי לחיצה בלבד, עם השהיה קצרה בין שליחות (קצב אנושי).
- *    • אין סודות בקוד — WEBHOOK_URL / SHARED_SECRET / LABEL_NAME נשמרים
- *      ב-GM storage דרך תפריט "הגדרות חיבור ל-CRM". לכן מותר לפרסם ציבורית.
+ *    • אין סודות בקוד — WEBHOOK_URL / SHARED_SECRET / תגיות נשמרים מקומית
+ *      ב-localStorage דרך טופס ההגדרות בפאנל. לכן מותר לפרסם ציבורית.
  *
- *  לפני שימוש ראשון: ראה "Step 0" ב-README — בדיקת קונסול שמאמתת איפה wa-js
+ *  ארכיטקטורה: רץ עם @grant none כדי ש-wa-js יתאתחל בהקשר הדף (תחת @grant +
+ *  sandbox הוא לא מצליח להתחבר ל-webpack של WhatsApp). לכן: השליחה ב-fetch
+ *  (ה-endpoint צריך CORS), והאחסון ב-localStorage.
+ *
+ *  לפני שימוש ראשון: ראה "Step 0" ב-README — בדיקה שמאמתת איפה wa-js
  *  מחזיק את תגיות הצ'אט בגרסה הספציפית שלך.
  * ──────────────────────────────────────────────────────────────────────────
  */
@@ -41,7 +40,7 @@
   'use strict';
 
   // לוג טעינה — אם השורה הזו לא מופיעה בקונסול, הסקריפט עצמו לא רץ (בד"כ @require נכשל).
-  console.log('%c[Leads Sync] v1.4.1 נטען', 'color:#00a884;font-weight:bold');
+  console.log('%c[Leads Sync] v1.5.0 נטען', 'color:#00a884;font-weight:bold');
 
   // ───────────────────────────── מפתחות אחסון ─────────────────────────────
   const STORE = {
@@ -59,32 +58,55 @@
   const SEND_DELAY_MIN_MS = 600;
   const SEND_DELAY_MAX_MS = 1200;
 
+  // ───────────────────────── אחסון מקומי (localStorage) ───────────────────
+  // תחת @grant none אין GM storage, לכן שומרים ב-localStorage. המפתחות מקבלים
+  // prefix כדי לא להתנגש עם WhatsApp, והערכים נשמרים כ-JSON.
+  const LS_PREFIX = 'wals_';
+  const store = {
+    get(key, def) {
+      try {
+        const raw = localStorage.getItem(LS_PREFIX + key);
+        return raw === null ? def : JSON.parse(raw);
+      } catch (e) {
+        return def;
+      }
+    },
+    set(key, val) {
+      try {
+        localStorage.setItem(LS_PREFIX + key, JSON.stringify(val));
+      } catch (e) {
+        /* מתעלמים — אחסון חסום */
+      }
+    },
+    del(key) {
+      try {
+        localStorage.removeItem(LS_PREFIX + key);
+      } catch (e) {
+        /* מתעלמים */
+      }
+    },
+  };
+
   // ───────────────────────────── עזרי config ─────────────────────────────
   const cfg = {
     get webhookUrl() {
-      return (GM_getValue(STORE.WEBHOOK_URL, '') || '').trim();
+      return String(store.get(STORE.WEBHOOK_URL, '') || '').trim();
     },
     get sharedSecret() {
-      return (GM_getValue(STORE.SHARED_SECRET, '') || '').trim();
+      return String(store.get(STORE.SHARED_SECRET, '') || '').trim();
     },
     // התגיות שנבחרו לסנכרון — מערך של {id, name}. עם מיגרציה מהמפתח הישן (תגית בודדת).
     get selectedLabels() {
-      try {
-        const raw = GM_getValue(STORE.LABELS, '');
-        if (raw) {
-          const arr = JSON.parse(raw);
-          if (Array.isArray(arr)) return arr.filter((x) => x && x.name);
-        }
-      } catch (e) {
-        /* נופל למיגרציה */
-      }
+      const arr = store.get(STORE.LABELS, null);
+      if (Array.isArray(arr)) return arr.filter((x) => x && x.name);
       // מיגרציה: אם קיים שם תגית ישן בודד — להמיר לרשימה.
-      const legacy = (GM_getValue(STORE.LABEL_NAME, '') || '').trim();
+      const legacy = String(store.get(STORE.LABEL_NAME, '') || '').trim();
       return legacy ? [{ id: null, name: legacy }] : [];
     },
     // DRY_RUN ברירת מחדל: true (לא שולח כלום, רק מדפיס).
     get dryRun() {
-      return GM_getValue(STORE.DRY_RUN, true);
+      const v = store.get(STORE.DRY_RUN, true);
+      return v === undefined ? true : Boolean(v);
     },
     isConfigured() {
       return Boolean(this.webhookUrl && this.sharedSecret);
@@ -124,14 +146,10 @@
     return bytesToHex(sig);
   }
 
-  // ───────────────────────── תפריטי Tampermonkey ─────────────────────────
-  // הכל זמין דרך הפאנל ה-GUI; התפריט משמש כקיצור/גיבוי.
-  GM_registerMenuCommand('פתח ממשק סנכרון לידים', () => ui.open());
-  GM_registerMenuCommand('בדיקת תגיות (Step 0)', runLabelDiagnostics);
-  GM_registerMenuCommand('מחק נתונים מקומיים', clearLocalData);
+  // הערה: תחת @grant none אין GM_registerMenuCommand — כל הפעולות זמינות דרך
+  // הפאנל ה-GUI (כפתור צף → סנכרון / בדיקת תגיות / הגדרות / מחיקת נתונים).
 
-  // Step 0 — בדיקת מבנה התגיות. רץ בתוך ההקשר של הסקריפט (שם WPP מוגדר), כי
-  // הקונסול של הדף רץ בהקשר אחר ולכן לא רואה את WPP (ראה README). מדפיס לקונסול.
+  // Step 0 — בדיקת מבנה התגיות. מדפיס לקונסול את התגיות ומבנה הצ'אט לאימות.
   async function runLabelDiagnostics() {
     try {
       console.log(
@@ -205,10 +223,7 @@
     if (!confirm('למחוק את כל הנתונים המקומיים (URL, סוד, תגית, מצב)? פעולה בלתי הפיכה.')) {
       return;
     }
-    for (const key of ALL_STORE_KEYS) {
-      if (typeof GM_deleteValue === 'function') GM_deleteValue(key);
-      else GM_setValue(key, ''); // fallback אם GM_deleteValue לא זמין
-    }
+    for (const key of ALL_STORE_KEYS) store.del(key);
     if (ui.built) {
       ui.refresh();
       ui.status('כל הנתונים המקומיים נמחקו. הזן הגדרות מחדש.', 'success');
@@ -223,11 +238,11 @@
   // ממתינים עד ש-WPP נטען ומאותחל. מבדיל בין שני כשלים:
   //   • WPP לא קיים כלל → ה-@require של wa-js לא נטען.
   //   • WPP קיים אך לא "ready" בזמן → WhatsApp עדיין נטען / חוסר תאימות גרסה.
-  // משתמשים ב-WPP.waitReady() הרשמי אם קיים, עם נפילה ל-polling של isReady.
+  // ב-wa-js 4.x ה-API הוא WPP.onReady(cb) (אין waitReady). נופלים ל-polling של isReady.
   async function waitForWPP(timeoutMs = 90000) {
     const started = Date.now();
 
-    // 1) להמתין שאובייקט ה-WPP בכלל יופיע (אחרת ה-@require נכשל).
+    // 1) להמתין שאובייקט ה-WPP בכלל יופיע (אחרת ה-@require נכשל / לא בהקשר הדף).
     while (typeof window.WPP === 'undefined') {
       if (Date.now() - started > 15000) {
         throw new Error('wa-js (WPP) לא נטען כלל — בדוק חיבור/@require והתקנה מחדש.');
@@ -238,17 +253,18 @@
     const WPP = window.WPP;
     if (WPP.isReady) return WPP;
 
-    // 2) הדרך הרשמית: WPP.waitReady() מחזיר Promise שמתממש כשהמודולים מוכנים.
-    if (typeof WPP.waitReady === 'function') {
+    // 2) הדרך הרשמית: WPP.onReady(cb) — נרשמים לאירוע, עם timeout.
+    const notReady = new Error(
+      'wa-js (WPP) נטען אך לא הגיע ל-ready בזמן — ודא ש-WhatsApp Web פתוח ומחובר.'
+    );
+    if (typeof WPP.onReady === 'function') {
       let timer;
+      const ready = new Promise((resolve) => WPP.onReady(resolve));
       const timeout = new Promise((_, rej) => {
-        timer = setTimeout(
-          () => rej(new Error('wa-js (WPP) נטען אך לא הגיע ל-ready בזמן — ודא ש-WhatsApp Web פתוח ומחובר.')),
-          timeoutMs
-        );
+        timer = setTimeout(() => rej(notReady), timeoutMs);
       });
       try {
-        await Promise.race([Promise.resolve(WPP.waitReady()), timeout]);
+        await Promise.race([ready, timeout]);
         return WPP;
       } finally {
         clearTimeout(timer);
@@ -257,9 +273,7 @@
 
     // 3) נפילה: polling על isReady.
     while (!WPP.isReady) {
-      if (Date.now() - started > timeoutMs) {
-        throw new Error('wa-js (WPP) נטען אך לא הגיע ל-ready בזמן — ודא ש-WhatsApp Web פתוח ומחובר.');
-      }
+      if (Date.now() - started > timeoutMs) throw notReady;
       await sleep(500);
     }
     return WPP;
@@ -390,26 +404,27 @@
     const timestamp = String(Math.floor(Date.now() / 1000)); // שניות מאז epoch
     const signature = await hmacSignHex(cfg.sharedSecret, timestamp + '.' + body);
 
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
+    // תחת @grant none שולחים ב-fetch רגיל → ה-endpoint ב-Base44 חייב להחזיר כותרות
+    // CORS (כולל מענה ל-OPTIONS preflight). ראה docs/base44-endpoint.md.
+    let res;
+    try {
+      res = await fetch(url, {
         method: 'POST',
-        url,
         headers: {
           'Content-Type': 'application/json',
           'X-Timestamp': timestamp,
           'X-Signature': signature, // hex של HMAC-SHA256 — הסוד עצמו לא נשלח
         },
-        data: body,
-        timeout: 20000,
-        onload: (res) => {
-          if (res.status >= 200 && res.status < 300) resolve({ status: res.status });
-          // ללא responseText — רק קוד הסטטוס, כדי לא להדליף PII ללוג/קונסול.
-          else reject(new Error('HTTP ' + res.status));
-        },
-        onerror: () => reject(new Error('שגיאת רשת בשליחה')),
-        ontimeout: () => reject(new Error('timeout בשליחה')),
+        body,
+        mode: 'cors',
+        credentials: 'omit',
       });
-    });
+    } catch (e) {
+      throw new Error('שגיאת רשת/CORS בשליחה — ודא שה-endpoint ב-Base44 מאשר CORS.');
+    }
+    // לא קוראים את גוף התשובה — רק קוד הסטטוס, כדי לא להדליף PII ללוג/קונסול.
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return { status: res.status };
   }
 
   // ─────────────────────────── זרימת הסנכרון ─────────────────────────────
@@ -665,7 +680,7 @@
       r.save.addEventListener('click', () => this.saveSettings());
       r.clear.addEventListener('click', clearLocalData);
       r.dry.addEventListener('change', () => {
-        GM_setValue(STORE.DRY_RUN, r.dry.checked);
+        store.set(STORE.DRY_RUN, r.dry.checked);
         this.refresh();
         this.status(r.dry.checked ? 'מצב DRY_RUN פעיל — לא יישלח כלום.' : 'מצב שליחה אמיתית פעיל.', 'info');
       });
@@ -801,9 +816,9 @@
 
     saveSettings() {
       const r = this.refs;
-      GM_setValue(STORE.WEBHOOK_URL, r.url.value.trim());
-      GM_setValue(STORE.SHARED_SECRET, r.secret.value.trim());
-      GM_setValue(STORE.LABELS, JSON.stringify(this.getCheckedLabels()));
+      store.set(STORE.WEBHOOK_URL, r.url.value.trim());
+      store.set(STORE.SHARED_SECRET, r.secret.value.trim());
+      store.set(STORE.LABELS, this.getCheckedLabels());
       this.refresh();
       this.status('ההגדרות נשמרו.', 'success');
     },
