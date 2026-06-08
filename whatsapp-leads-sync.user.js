@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.3.0
+// @version      1.3.1
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
 // @run-at       document-idle
-// @require      https://github.com/wppconnect-team/wa-js/releases/download/v4.3.0/wppconnect-wa.js
+// @require      https://cdn.jsdelivr.net/npm/@wppconnect/wa-js@4.3.0/dist/wppconnect-wa.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -39,6 +39,9 @@
 
 (function () {
   'use strict';
+
+  // לוג טעינה — אם השורה הזו לא מופיעה בקונסול, הסקריפט עצמו לא רץ (בד"כ @require נכשל).
+  console.log('%c[Leads Sync] v1.3.1 נטען', 'color:#00a884;font-weight:bold');
 
   // ───────────────────────────── מפתחות אחסון ─────────────────────────────
   const STORE = {
@@ -641,8 +644,14 @@
 
   // ──────────────────────────────── אתחול ────────────────────────────────
   function init() {
-    if (document.body) ui.build();
-    else window.addEventListener('DOMContentLoaded', () => ui.build());
+    try {
+      if (document.body) ui.build();
+      else window.addEventListener('DOMContentLoaded', () => ui.build());
+      console.log('%c[Leads Sync] הממשק אותחל — חפש כפתור צף בפינה התחתונה',
+        'color:#00a884');
+    } catch (e) {
+      console.error('[Leads Sync] כשל באתחול הממשק:', e);
+    }
   }
 
   init();
