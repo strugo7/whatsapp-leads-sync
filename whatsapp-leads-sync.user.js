@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.0.0
+// @version      1.1.0
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
@@ -10,6 +10,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
 // @connect      base44.app
 // @updateURL    https://raw.githubusercontent.com/strugo7/whatsapp-leads-sync/main/whatsapp-leads-sync.user.js
@@ -45,10 +46,10 @@
     SHARED_SECRET: 'cfg_shared_secret',
     LABEL_NAME: 'cfg_label_name',
     DRY_RUN: 'cfg_dry_run',
-    // dedup קל בצד הלקוח — נשמרים רק hashים, אף פעם לא טלפון בטקסט גלוי.
-    SENT_HASHES: 'state_sent_hashes',
-    SALT: 'state_dedup_salt', // salt אקראי פר-התקנה ל-hash של הטלפונים
   };
+
+  // כל מפתחות האחסון המקומיים — לשימוש כפתור "מחק נתונים מקומיים".
+  const ALL_STORE_KEYS = Object.values(STORE);
 
   const DEFAULT_LABEL_NAME = 'לידים חדשים לטיפול';
 
@@ -76,30 +77,13 @@
     },
   };
 
-  // ─────────────────────── פרטיות: hashing + masking ──────────────────────
-  // אנחנו לא שומרים טלפונים בטקסט גלוי בשום מקום מתמשך. ל-dedup שומרים רק
-  // SHA-256 של (salt + טלפון). ה-salt אקראי ונוצר פעם אחת פר-התקנה.
+  // ────────────────────────── פרטיות: עזרים ──────────────────────────────
+  // אין שמירה מקומית של טלפונים כלל (אין dedup מקומי) — ה-dedup הסופי קורה
+  // בשרת דרך upsert. מקומית אנחנו רק ממסכים טלפונים בקונסול וחותמים בקשות.
   function bytesToHex(buf) {
     return [...new Uint8Array(buf)]
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
-  }
-
-  function getSalt() {
-    let s = GM_getValue(STORE.SALT, '');
-    if (!s) {
-      const rnd = new Uint8Array(16);
-      crypto.getRandomValues(rnd);
-      s = bytesToHex(rnd.buffer);
-      GM_setValue(STORE.SALT, s);
-    }
-    return s;
-  }
-
-  async function hashPhone(phone) {
-    const data = new TextEncoder().encode(getSalt() + '|' + phone);
-    const digest = await crypto.subtle.digest('SHA-256', data);
-    return bytesToHex(digest);
   }
 
   // מיסוך טלפון לתצוגה בקונסול בלבד: +972***67 (לא חושף את המספר המלא).
@@ -109,36 +93,50 @@
     return '+' + digits.slice(0, 3) + '***' + digits.slice(-2);
   }
 
-  function getSentHashes() {
-    try {
-      const raw = GM_getValue(STORE.SENT_HASHES, '[]');
-      const arr = JSON.parse(raw);
-      return new Set(Array.isArray(arr) ? arr : []);
-    } catch (e) {
-      return new Set();
-    }
-  }
-
-  function markHashSent(hash) {
-    const set = getSentHashes();
-    set.add(hash);
-    GM_setValue(STORE.SENT_HASHES, JSON.stringify([...set]));
+  // חתימת HMAC-SHA256 על מחרוזת, מוחזרת כ-hex. הסוד משמש כמפתח ואינו נשלח ברשת.
+  async function hmacSignHex(secret, message) {
+    const key = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+    const sig = await crypto.subtle.sign(
+      'HMAC',
+      key,
+      new TextEncoder().encode(message)
+    );
+    return bytesToHex(sig);
   }
 
   // ───────────────────────── תפריטי Tampermonkey ─────────────────────────
   GM_registerMenuCommand('הגדרות חיבור ל-CRM', openSettings);
   GM_registerMenuCommand('מצב הרצה (DRY_RUN / שליחה אמיתית)', toggleDryRun);
+  GM_registerMenuCommand('מחק נתונים מקומיים', clearLocalData);
+
+  // מוחק את כל הנתונים המקומיים (URL, סוד, תגית, מצב). אפס עקבות במכשיר.
+  function clearLocalData() {
+    if (!confirm('למחוק את כל הנתונים המקומיים (URL, סוד, תגית, מצב)? פעולה בלתי הפיכה.')) {
+      return;
+    }
+    for (const key of ALL_STORE_KEYS) {
+      if (typeof GM_deleteValue === 'function') GM_deleteValue(key);
+      else GM_setValue(key, ''); // fallback אם GM_deleteValue לא זמין
+    }
+    alert('כל הנתונים המקומיים נמחקו. הזן הגדרות מחדש דרך "הגדרות חיבור ל-CRM".');
+  }
 
   function openSettings() {
     const url = prompt(
-      'כתובת ה-Webhook של ה-CRM ב-Base44 (URL מלא):',
+      'כתובת ה-Webhook של ה-CRM ב-Base44 (URL מלא, חייב HTTPS):',
       cfg.webhookUrl
     );
     if (url === null) return; // המשתמש ביטל
     GM_setValue(STORE.WEBHOOK_URL, url.trim());
 
     const secret = prompt(
-      'הסוד המשותף (x-api-key) — נשמר מקומית בלבד, לא בקוד:',
+      'הסוד המשותף (משמש לחתימת HMAC) — נשמר מקומית בלבד, ולא נשלח ברשת:',
       cfg.sharedSecret
     );
     if (secret !== null) GM_setValue(STORE.SHARED_SECRET, secret.trim());
@@ -269,28 +267,36 @@
   }
 
   // ───────────────────────────── שליחה ל-CRM ──────────────────────────────
-  // הטלפון נשלח אך ורק כאן, אל ה-webhook המוגדר, ואך ורק מעל HTTPS (מוצפן בתעבורה).
-  // לא מתעדים את גוף התשובה (responseText) — הוא עלול להחזיר את הטלפון ולהדליף אותו לקונסול.
-  function postLead(lead) {
+  // אבטחה:
+  //  • HTTPS בלבד (הטלפון מוצפן בתעבורה).
+  //  • אימות דרך חתימת HMAC-SHA256 על (timestamp + "." + body) — הסוד עצמו
+  //    אף פעם לא נשלח ברשת, רק החתימה. החותמת מאפשרת לשרת לדחות replay (חלון ~5 דק').
+  //  • לא מתעדים את גוף התשובה (responseText) — הוא עלול להחזיר את הטלפון.
+  async function postLead(lead) {
+    const url = cfg.webhookUrl;
+    if (!/^https:\/\//i.test(url)) {
+      throw new Error('ה-Webhook חייב להיות HTTPS (כדי שהטלפון יישלח מוצפן).');
+    }
+
+    const body = JSON.stringify({
+      phone: lead.phone,
+      name: lead.name,
+      source: 'whatsapp-web',
+      synced_at: new Date().toISOString(),
+    });
+    const timestamp = String(Math.floor(Date.now() / 1000)); // שניות מאז epoch
+    const signature = await hmacSignHex(cfg.sharedSecret, timestamp + '.' + body);
+
     return new Promise((resolve, reject) => {
-      const url = cfg.webhookUrl;
-      if (!/^https:\/\//i.test(url)) {
-        reject(new Error('ה-Webhook חייב להיות HTTPS (כדי שהטלפון יישלח מוצפן).'));
-        return;
-      }
       GM_xmlhttpRequest({
         method: 'POST',
         url,
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': cfg.sharedSecret,
+          'X-Timestamp': timestamp,
+          'X-Signature': signature, // hex של HMAC-SHA256 — הסוד עצמו לא נשלח
         },
-        data: JSON.stringify({
-          phone: lead.phone,
-          name: lead.name,
-          source: 'whatsapp-web',
-          synced_at: new Date().toISOString(),
-        }),
+        data: body,
         timeout: 20000,
         onload: (res) => {
           if (res.status >= 200 && res.status < 300) resolve({ status: res.status });
@@ -322,48 +328,39 @@
       const WPP = await waitForWPP();
       const leads = await collectLeads(WPP);
 
-      // dedup לפי hash בלבד — אף פעם לא משווים/שומרים טלפון בטקסט גלוי.
-      const sent = getSentHashes();
-      for (const l of leads) l.hash = await hashPhone(l.phone);
-      const fresh = leads.filter((l) => !sent.has(l.hash));
-
-      if (fresh.length === 0) {
+      // אין dedup מקומי — לא שומרים כלום על המכשיר. ה-dedup הסופי הוא ה-upsert
+      // בשרת (לפי טלפון), כך שאפשר לשלוח את אותו ליד שוב בלי ליצור כפילות.
+      if (leads.length === 0) {
         setBtnState('idle', 'סנכרן לידים');
-        alert(
-          'אין לידים חדשים לסנכרון.\n' +
-            'נמצאו ' +
-            leads.length +
-            ' תחת התגית, כולם כבר נשלחו בעבר.'
-        );
+        alert('לא נמצאו צ\'אטים תחת התגית "' + cfg.labelName + '".');
         return;
       }
 
       // ── DRY_RUN: רק מדפיסים, לא שולחים כלום ──
       if (cfg.dryRun) {
         console.log(
-          '%c[Leads Sync] DRY_RUN — לא נשלח כלום. הלידים החדשים:',
+          '%c[Leads Sync] DRY_RUN — לא נשלח כלום. הלידים שתחת התגית:',
           'font-weight:bold'
         );
         // מציגים טלפון ממוסך בלבד (לא המספר המלא), והשם לזיהוי הליד.
         console.table(
-          fresh.map((l) => ({ phone: maskPhone(l.phone), name: l.name }))
+          leads.map((l) => ({ phone: maskPhone(l.phone), name: l.name }))
         );
         alert(
           'DRY_RUN: נמצאו ' +
-            fresh.length +
-            ' לידים חדשים (ראה console.table). לא נשלח כלום.\n' +
+            leads.length +
+            ' לידים תחת התגית (ראה console.table). לא נשלח כלום.\n' +
             'להפעלת שליחה אמיתית: תפריט Tampermonkey → "מצב הרצה".'
         );
         return;
       }
 
-      // ── שליחה אמיתית, אחד-אחד עם השהיה אנושית ──
+      // ── שליחה אמיתית, אחד-אחד עם השהיה אנושית. השרת עושה upsert לפי טלפון. ──
       let okCount = 0;
       let failCount = 0;
-      for (const lead of fresh) {
+      for (const lead of leads) {
         try {
           await postLead(lead);
-          markHashSent(lead.hash); // dedup רק אחרי הצלחה — נשמר hash, לא טלפון
           okCount++;
         } catch (e) {
           failCount++;
@@ -382,8 +379,7 @@
           'נשלחו: ' +
           okCount +
           (failCount ? '\nנכשלו: ' + failCount : '') +
-          '\nדילוגים (כבר נשלחו בעבר): ' +
-          (leads.length - fresh.length)
+          '\n(ה-CRM מאחד כפילויות לפי טלפון.)'
       );
     } catch (e) {
       console.error('[Leads Sync] שגיאה:', e);
