@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.1.0
+// @version      1.2.0
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
@@ -113,7 +113,57 @@
   // ───────────────────────── תפריטי Tampermonkey ─────────────────────────
   GM_registerMenuCommand('הגדרות חיבור ל-CRM', openSettings);
   GM_registerMenuCommand('מצב הרצה (DRY_RUN / שליחה אמיתית)', toggleDryRun);
+  GM_registerMenuCommand('בדיקת תגיות (Step 0)', runLabelDiagnostics);
   GM_registerMenuCommand('מחק נתונים מקומיים', clearLocalData);
+
+  // Step 0 — בדיקת מבנה התגיות. רץ בתוך ההקשר של הסקריפט (שם WPP מוגדר), כי
+  // הקונסול של הדף רץ בהקשר אחר ולכן לא רואה את WPP (ראה README). מדפיס לקונסול.
+  async function runLabelDiagnostics() {
+    try {
+      console.log(
+        '%c[Leads Sync] Step 0 — בדיקת תגיות',
+        'font-weight:bold;font-size:14px'
+      );
+      const WPP = await waitForWPP();
+
+      // 1) ה-API הזמין תחת WPP.labels בגרסת wa-js שלך
+      console.log('WPP.labels keys:', Object.keys(WPP.labels).sort());
+
+      // 2) רשימת התגיות (id + שם)
+      const labels = (await WPP.labels.getAllLabels()) || [];
+      console.table(labels.map((l) => ({ id: l.id, name: l.name })));
+
+      // 3) מבנה התגיות בצ'אט לדוגמה — מדפיסים רק מפתחות ושדה labels, בלי לחשוף טלפון.
+      const chats = (await WPP.chat.list()) || [];
+      const sample = chats.find((c) => c && c.labels);
+      if (sample) {
+        console.log('מפתחות chat לדוגמה:', Object.keys(sample));
+        console.log('chat.labels לדוגמה:', sample.labels);
+      } else {
+        console.log(
+          'לא נמצא צ\'אט עם שדה labels — ייתכן שהמבנה שונה בגרסה שלך. בדוק Object.keys(chat) ועדכן את chatHasLabel().'
+        );
+      }
+
+      // 4) כמה צ'אטים מזוהים תחת התגית המוגדרת (אימות הצינור מקצה לקצה)
+      const label = labels.find((l) => String(l.name).trim() === cfg.labelName);
+      if (!label) {
+        console.warn('לא נמצאה תגית בשם:', cfg.labelName);
+      } else {
+        const count = chats.filter((c) =>
+          chatHasLabel(c, String(label.id))
+        ).length;
+        console.log(
+          'צ\'אטים שזוהו תחת התגית "' + cfg.labelName + '":',
+          count
+        );
+      }
+      alert('בדיקת Step 0 הסתיימה — פתח את ה-Console (F12) כדי לראות את התוצאות.');
+    } catch (e) {
+      console.error('[Leads Sync] שגיאה בבדיקה:', e);
+      alert('שגיאה בבדיקה: ' + (e && e.message ? e.message : e));
+    }
+  }
 
   // מוחק את כל הנתונים המקומיים (URL, סוד, תגית, מצב). אפס עקבות במכשיר.
   function clearLocalData() {
