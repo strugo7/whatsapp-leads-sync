@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.6.1
+// @version      1.6.2
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
@@ -41,7 +41,7 @@
   'use strict';
 
   // לוג טעינה — אם השורה הזו לא מופיעה בקונסול, הסקריפט עצמו לא רץ (בד"כ @require נכשל).
-  console.log('%c[Leads Sync] v1.6.1 נטען', 'color:#00a884;font-weight:bold');
+  console.log('%c[Leads Sync] v1.6.2 נטען', 'color:#00a884;font-weight:bold');
 
   // ───────────────────────────── מפתחות אחסון ─────────────────────────────
   const STORE = {
@@ -334,8 +334,13 @@
 
   // בונה מחרוזת CSV. BOM של UTF-8 כדי ששמות בעברית ייפתחו נכון באקסל; שורות CRLF.
   function csvEscape(val) {
-    const s = String(val == null ? '' : val);
-    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    let s = String(val == null ? '' : val);
+    // הגנה מפני CSV formula injection: ערך שמתחיל ב- = + - @ Tab CR עלול להתפרש
+    // כנוסחה באקסל/Sheets (שם איש קשר הוא קלט לא-מהימן; גם טלפון מתחיל ב-+).
+    // מקדימים גרש (') ומכריחים ציטוט כדי שהגרש יישמר.
+    const formulaRisk = /^[=+\-@\t\r]/.test(s);
+    if (formulaRisk) s = "'" + s;
+    return /[",\n\r]/.test(s) || formulaRisk ? '"' + s.replace(/"/g, '""') + '"' : s;
   }
   function buildCsv(headers, rows) {
     const BOM = '\uFEFF'; // U+FEFF — כדי ששמות בעברית ייפתחו נכון באקסל
@@ -437,8 +442,8 @@
           if (resp.status >= 200 && resp.status < 300) {
             resolve({ status: resp.status });
           } else {
-            // מדפיסים את גוף התשובה לדיבוג (ללא טלפון — רק הודעת השרת).
-            console.warn('[Leads Sync] HTTP', resp.status, '— response:', resp.responseText);
+            // אינווריאנט: לא קוראים/מדפיסים את גוף התשובה — עלול להחזיר PII.
+            // רק הסטטוס; הטלפון הממוסך נרשם ב-catch של syncLeads.
             reject(new Error('HTTP ' + resp.status));
           }
         },
