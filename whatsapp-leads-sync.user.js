@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.2.0
+// @version      1.3.0
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
@@ -111,8 +111,8 @@
   }
 
   // ───────────────────────── תפריטי Tampermonkey ─────────────────────────
-  GM_registerMenuCommand('הגדרות חיבור ל-CRM', openSettings);
-  GM_registerMenuCommand('מצב הרצה (DRY_RUN / שליחה אמיתית)', toggleDryRun);
+  // הכל זמין דרך הפאנל ה-GUI; התפריט משמש כקיצור/גיבוי.
+  GM_registerMenuCommand('פתח ממשק סנכרון לידים', () => ui.open());
   GM_registerMenuCommand('בדיקת תגיות (Step 0)', runLabelDiagnostics);
   GM_registerMenuCommand('מחק נתונים מקומיים', clearLocalData);
 
@@ -158,10 +158,14 @@
           count
         );
       }
-      alert('בדיקת Step 0 הסתיימה — פתח את ה-Console (F12) כדי לראות את התוצאות.');
+      const okMsg = 'בדיקת Step 0 הסתיימה — פרטים מלאים ב-Console (F12).';
+      if (ui.built) ui.status(okMsg, 'success');
+      else alert(okMsg);
     } catch (e) {
       console.error('[Leads Sync] שגיאה בבדיקה:', e);
-      alert('שגיאה בבדיקה: ' + (e && e.message ? e.message : e));
+      const errMsg = 'שגיאה בבדיקה: ' + (e && e.message ? e.message : e);
+      if (ui.built) ui.status(errMsg, 'error');
+      else alert(errMsg);
     }
   }
 
@@ -174,47 +178,12 @@
       if (typeof GM_deleteValue === 'function') GM_deleteValue(key);
       else GM_setValue(key, ''); // fallback אם GM_deleteValue לא זמין
     }
-    alert('כל הנתונים המקומיים נמחקו. הזן הגדרות מחדש דרך "הגדרות חיבור ל-CRM".');
-  }
-
-  function openSettings() {
-    const url = prompt(
-      'כתובת ה-Webhook של ה-CRM ב-Base44 (URL מלא, חייב HTTPS):',
-      cfg.webhookUrl
-    );
-    if (url === null) return; // המשתמש ביטל
-    GM_setValue(STORE.WEBHOOK_URL, url.trim());
-
-    const secret = prompt(
-      'הסוד המשותף (משמש לחתימת HMAC) — נשמר מקומית בלבד, ולא נשלח ברשת:',
-      cfg.sharedSecret
-    );
-    if (secret !== null) GM_setValue(STORE.SHARED_SECRET, secret.trim());
-
-    const label = prompt(
-      'שם התגית לסנכרון (כפי שמופיע ב-WhatsApp):',
-      cfg.labelName
-    );
-    if (label !== null) {
-      GM_setValue(STORE.LABEL_NAME, (label.trim() || DEFAULT_LABEL_NAME));
+    if (ui.built) {
+      ui.refresh();
+      ui.status('כל הנתונים המקומיים נמחקו. הזן הגדרות מחדש.', 'success');
+    } else {
+      alert('כל הנתונים המקומיים נמחקו.');
     }
-
-    alert(
-      'ההגדרות נשמרו.\n\n' +
-        'מצב נוכחי: ' +
-        (cfg.dryRun ? 'DRY_RUN (לא שולח, רק מדפיס)' : 'שליחה אמיתית') +
-        '\nתגית: ' +
-        cfg.labelName
-    );
-  }
-
-  function toggleDryRun() {
-    const next = !cfg.dryRun;
-    GM_setValue(STORE.DRY_RUN, next);
-    alert(
-      'מצב הרצה עודכן ל: ' +
-        (next ? 'DRY_RUN — לא שולח כלום, רק מדפיס console.table' : 'שליחה אמיתית')
-    );
   }
 
   // ──────────────────────────── המתנה ל-wa-js ─────────────────────────────
@@ -365,42 +334,40 @@
   async function syncLeads() {
     if (isSyncing) return;
     isSyncing = true;
-    setBtnState('busy', 'מסנכרן…');
+    ui.open();
+    ui.setBusy(true);
+    ui.clearResults();
 
     try {
       if (!cfg.dryRun && !cfg.isConfigured()) {
-        alert(
-          'חסרות הגדרות. פתח את תפריט Tampermonkey → "הגדרות חיבור ל-CRM" והזן URL + סוד.'
-        );
+        ui.status('חסרות הגדרות. פתח "הגדרות" והזן כתובת Webhook + סוד.', 'error');
+        ui.showSettings(true);
         return;
       }
 
+      ui.status('טוען את WhatsApp…', 'info');
       const WPP = await waitForWPP();
+      ui.status('קורא לידים מהתגית…', 'info');
       const leads = await collectLeads(WPP);
 
       // אין dedup מקומי — לא שומרים כלום על המכשיר. ה-dedup הסופי הוא ה-upsert
       // בשרת (לפי טלפון), כך שאפשר לשלוח את אותו ליד שוב בלי ליצור כפילות.
       if (leads.length === 0) {
-        setBtnState('idle', 'סנכרן לידים');
-        alert('לא נמצאו צ\'אטים תחת התגית "' + cfg.labelName + '".');
+        ui.status('לא נמצאו צ\'אטים תחת התגית "' + cfg.labelName + '".', 'warn');
         return;
       }
 
-      // ── DRY_RUN: רק מדפיסים, לא שולחים כלום ──
+      // טלפונים ממוסכים בלבד לתצוגה (קונסול + פאנל).
+      const masked = leads.map((l) => ({ phone: maskPhone(l.phone), name: l.name }));
+
+      // ── DRY_RUN: רק מציגים, לא שולחים כלום ──
       if (cfg.dryRun) {
-        console.log(
-          '%c[Leads Sync] DRY_RUN — לא נשלח כלום. הלידים שתחת התגית:',
-          'font-weight:bold'
-        );
-        // מציגים טלפון ממוסך בלבד (לא המספר המלא), והשם לזיהוי הליד.
-        console.table(
-          leads.map((l) => ({ phone: maskPhone(l.phone), name: l.name }))
-        );
-        alert(
-          'DRY_RUN: נמצאו ' +
-            leads.length +
-            ' לידים תחת התגית (ראה console.table). לא נשלח כלום.\n' +
-            'להפעלת שליחה אמיתית: תפריט Tampermonkey → "מצב הרצה".'
+        console.log('%c[Leads Sync] DRY_RUN — לא נשלח כלום.', 'font-weight:bold');
+        console.table(masked);
+        ui.showLeadsTable(masked);
+        ui.status(
+          'DRY_RUN: נמצאו ' + leads.length + ' לידים. לא נשלח כלום (טלפונים ממוסכים).',
+          'success'
         );
         return;
       }
@@ -408,7 +375,9 @@
       // ── שליחה אמיתית, אחד-אחד עם השהיה אנושית. השרת עושה upsert לפי טלפון. ──
       let okCount = 0;
       let failCount = 0;
-      for (const lead of leads) {
+      for (let i = 0; i < leads.length; i++) {
+        const lead = leads[i];
+        ui.status('שולח ' + (i + 1) + ' מתוך ' + leads.length + '…', 'info');
         try {
           await postLead(lead);
           okCount++;
@@ -424,63 +393,256 @@
         await sleep(randDelay());
       }
 
-      alert(
-        'הסנכרון הסתיים.\n' +
-          'נשלחו: ' +
-          okCount +
-          (failCount ? '\nנכשלו: ' + failCount : '') +
-          '\n(ה-CRM מאחד כפילויות לפי טלפון.)'
+      ui.showLeadsTable(masked);
+      ui.status(
+        'הסתיים. נשלחו: ' + okCount +
+          (failCount ? ' · נכשלו: ' + failCount : '') +
+          ' (ה-CRM מאחד לפי טלפון).',
+        failCount ? 'warn' : 'success'
       );
     } catch (e) {
       console.error('[Leads Sync] שגיאה:', e);
-      alert('שגיאה: ' + (e && e.message ? e.message : e));
+      ui.status('שגיאה: ' + (e && e.message ? e.message : e), 'error');
     } finally {
       isSyncing = false;
-      setBtnState('idle', 'סנכרן לידים');
+      ui.setBusy(false);
     }
   }
 
-  // ─────────────────────────── כפתור צף (RTL) ────────────────────────────
-  let btnEl = null;
+  // ───────────────────────────── ממשק (GUI) ──────────────────────────────
+  // פאנל צף משלנו בתוך Shadow DOM — מבודד לחלוטין מה-CSS של WhatsApp, RTL מלא,
+  // ולא נוגע ב-DOM של WhatsApp (יציב לאורך זמן, משטח זיהוי מינימלי).
+  const WA_GREEN = '#00a884';
+  const WA_DARK = '#075E54';
 
-  function injectButton() {
-    if (btnEl) return;
-    btnEl = document.createElement('button');
-    btnEl.textContent = 'סנכרן לידים';
-    btnEl.setAttribute('dir', 'rtl');
-    Object.assign(btnEl.style, {
-      position: 'fixed',
-      bottom: '24px',
-      insetInlineStart: '24px', // RTL: צמוד לפינה התחתונה (צד התחלה)
-      zIndex: '99999',
-      padding: '10px 18px',
-      background: '#075E54',
-      color: '#fff',
-      border: 'none',
-      borderRadius: '24px',
-      fontSize: '14px',
-      fontWeight: '600',
-      fontFamily: 'inherit',
-      cursor: 'pointer',
-      boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
-      direction: 'rtl',
-    });
-    btnEl.addEventListener('click', syncLeads);
-    document.body.appendChild(btnEl);
-  }
+  const UI_CSS = `
+    :host { all: initial; }
+    * { box-sizing: border-box; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .launcher {
+      position: fixed; bottom: 22px; inset-inline-start: 22px; z-index: 2147483646;
+      width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer;
+      background: ${WA_GREEN}; color: #fff; font-size: 24px; line-height: 1;
+      box-shadow: 0 4px 14px rgba(0,0,0,.35); transition: transform .12s ease;
+    }
+    .launcher:hover { transform: scale(1.06); }
+    .panel {
+      position: fixed; bottom: 90px; inset-inline-start: 22px; z-index: 2147483647;
+      width: 320px; max-height: 78vh; overflow-y: auto; direction: rtl;
+      background: #fff; color: #111b21; border-radius: 14px;
+      box-shadow: 0 10px 40px rgba(0,0,0,.32); border: 1px solid #e9edef;
+    }
+    .panel[hidden] { display: none; }
+    .hdr {
+      display: flex; align-items: center; justify-content: space-between;
+      background: ${WA_DARK}; color: #fff; padding: 12px 14px;
+      border-radius: 14px 14px 0 0;
+    }
+    .hdr .title { font-weight: 700; font-size: 15px; }
+    .hdr .x { background: none; border: none; color: #fff; font-size: 18px; cursor: pointer; padding: 2px 6px; }
+    .body { padding: 14px; }
+    .badges { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+    .badge { font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 20px; }
+    .badge.ok { background: #d9fdd3; color: #0a6b2e; }
+    .badge.warn { background: #fff3cd; color: #8a6100; }
+    .badge.err { background: #fde2e1; color: #b02a24; }
+    button.primary {
+      width: 100%; padding: 11px; border: none; border-radius: 10px; cursor: pointer;
+      background: ${WA_GREEN}; color: #fff; font-size: 15px; font-weight: 700;
+    }
+    button.primary:disabled { opacity: .55; cursor: default; }
+    .toggle { display: flex; align-items: center; gap: 8px; margin: 12px 0; font-size: 14px; cursor: pointer; }
+    .actions { display: flex; gap: 8px; margin-top: 4px; }
+    button.ghost {
+      flex: 1; padding: 8px; border: 1px solid #d1d7db; border-radius: 8px; cursor: pointer;
+      background: #f7f8fa; color: #111b21; font-size: 13px; font-weight: 600;
+    }
+    .settings { margin-top: 12px; border-top: 1px solid #eef1f3; padding-top: 12px; }
+    .settings[hidden] { display: none; }
+    .settings label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 10px; color: #54656f; }
+    .settings input {
+      width: 100%; margin-top: 4px; padding: 8px; border: 1px solid #d1d7db;
+      border-radius: 8px; font-size: 13px; direction: ltr; text-align: start;
+    }
+    .settings-actions { display: flex; gap: 8px; }
+    button.small { padding: 8px; font-size: 13px; }
+    button.danger { border: 1px solid #f1b0ad; background: #fff; color: #b02a24; border-radius: 8px; cursor: pointer; font-weight: 600; flex: 1; }
+    .status { margin-top: 12px; font-size: 13px; min-height: 18px; line-height: 1.4; }
+    .status.info { color: #54656f; }
+    .status.success { color: #0a6b2e; }
+    .status.warn { color: #8a6100; }
+    .status.error { color: #b02a24; }
+    .results { margin-top: 10px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: start; padding: 6px 8px; border-bottom: 1px solid #eef1f3; }
+    th { color: #54656f; font-weight: 700; }
+    td.ph { direction: ltr; text-align: start; font-variant-numeric: tabular-nums; }
+    .foot { margin-top: 12px; font-size: 11px; color: #8696a0; text-align: center; }
+  `;
 
-  function setBtnState(state, text) {
-    if (!btnEl) return;
-    btnEl.textContent = text;
-    btnEl.disabled = state === 'busy';
-    btnEl.style.opacity = state === 'busy' ? '0.6' : '1';
-    btnEl.style.cursor = state === 'busy' ? 'default' : 'pointer';
+  const UI_HTML = `
+    <button class="launcher" id="wals-launch" title="סנכרון לידים" aria-label="סנכרון לידים">↗</button>
+    <div class="panel" id="wals-panel" hidden>
+      <div class="hdr">
+        <span class="title">סנכרון לידים</span>
+        <button class="x" id="wals-close" title="סגור" aria-label="סגור">✕</button>
+      </div>
+      <div class="body">
+        <div class="badges">
+          <span class="badge" id="wals-conn"></span>
+          <span class="badge" id="wals-mode"></span>
+        </div>
+        <button class="primary" id="wals-sync">סנכרן לידים</button>
+        <label class="toggle"><input type="checkbox" id="wals-dry"> מצב DRY_RUN (לא שולח, רק מציג)</label>
+        <div class="actions">
+          <button class="ghost" id="wals-step0">בדיקת תגיות</button>
+          <button class="ghost" id="wals-settings-btn">הגדרות</button>
+        </div>
+        <div class="settings" id="wals-settings" hidden>
+          <label>כתובת Webhook (HTTPS)
+            <input type="url" id="wals-url" placeholder="https://...base44.app/...">
+          </label>
+          <label>סוד משותף (לחתימת HMAC)
+            <input type="password" id="wals-secret" placeholder="••••••••">
+          </label>
+          <label>שם התגית
+            <input type="text" id="wals-label">
+          </label>
+          <div class="settings-actions">
+            <button class="primary small" id="wals-save">שמור</button>
+            <button class="danger small" id="wals-clear">מחק נתונים</button>
+          </div>
+        </div>
+        <div class="status info" id="wals-status"></div>
+        <div class="results" id="wals-results"></div>
+        <div class="foot">READ-ONLY · סנכרון בלחיצה בלבד</div>
+      </div>
+    </div>
+  `;
+
+  const ui = {
+    built: false,
+    root: null,
+    refs: {},
+
+    build() {
+      if (this.built) return;
+      const host = document.createElement('div');
+      host.id = 'wals-host';
+      document.body.appendChild(host);
+      this.root = host.attachShadow({ mode: 'open' });
+
+      const style = document.createElement('style');
+      style.textContent = UI_CSS;
+      this.root.appendChild(style);
+
+      const wrap = document.createElement('div');
+      wrap.dir = 'rtl';
+      wrap.innerHTML = UI_HTML;
+      this.root.appendChild(wrap);
+
+      const $ = (id) => this.root.getElementById(id);
+      this.refs = {
+        launch: $('wals-launch'), panel: $('wals-panel'), close: $('wals-close'),
+        conn: $('wals-conn'), mode: $('wals-mode'), sync: $('wals-sync'),
+        dry: $('wals-dry'), step0: $('wals-step0'), settingsBtn: $('wals-settings-btn'),
+        settings: $('wals-settings'), url: $('wals-url'), secret: $('wals-secret'),
+        label: $('wals-label'), save: $('wals-save'), clear: $('wals-clear'),
+        status: $('wals-status'), results: $('wals-results'),
+      };
+
+      const r = this.refs;
+      r.launch.addEventListener('click', () => this.toggle());
+      r.close.addEventListener('click', () => this.close());
+      r.sync.addEventListener('click', syncLeads);
+      r.step0.addEventListener('click', runLabelDiagnostics);
+      r.settingsBtn.addEventListener('click', () => this.showSettings());
+      r.save.addEventListener('click', () => this.saveSettings());
+      r.clear.addEventListener('click', clearLocalData);
+      r.dry.addEventListener('change', () => {
+        GM_setValue(STORE.DRY_RUN, r.dry.checked);
+        this.refresh();
+        this.status(r.dry.checked ? 'מצב DRY_RUN פעיל — לא יישלח כלום.' : 'מצב שליחה אמיתית פעיל.', 'info');
+      });
+
+      this.built = true;
+      this.refresh();
+    },
+
+    open() { this.build(); this.refs.panel.hidden = false; this.refresh(); },
+    close() { if (this.built) this.refs.panel.hidden = true; },
+    toggle() { this.build(); this.refs.panel.hidden = !this.refs.panel.hidden; if (!this.refs.panel.hidden) this.refresh(); },
+
+    showSettings(force) {
+      if (!this.built) return;
+      const s = this.refs.settings;
+      s.hidden = force === true ? false : !s.hidden;
+    },
+
+    setBusy(busy) {
+      if (!this.built) return;
+      this.refs.sync.disabled = busy;
+      this.refs.sync.textContent = busy ? 'מסנכרן…' : 'סנכרן לידים';
+    },
+
+    status(text, type) {
+      if (!this.built) return;
+      this.refs.status.className = 'status ' + (type || 'info');
+      this.refs.status.textContent = text || '';
+    },
+
+    clearResults() { if (this.built) this.refs.results.innerHTML = ''; },
+
+    showLeadsTable(rows) {
+      if (!this.built) return;
+      const body = rows
+        .map(
+          (x) =>
+            '<tr><td class="ph">' + escapeHtml(x.phone) + '</td><td>' + escapeHtml(x.name) + '</td></tr>'
+        )
+        .join('');
+      this.refs.results.innerHTML =
+        '<table><thead><tr><th>טלפון (ממוסך)</th><th>שם</th></tr></thead><tbody>' +
+        body +
+        '</tbody></table>';
+    },
+
+    saveSettings() {
+      const r = this.refs;
+      GM_setValue(STORE.WEBHOOK_URL, r.url.value.trim());
+      GM_setValue(STORE.SHARED_SECRET, r.secret.value.trim());
+      GM_setValue(STORE.LABEL_NAME, r.label.value.trim() || DEFAULT_LABEL_NAME);
+      this.refresh();
+      this.status('ההגדרות נשמרו.', 'success');
+    },
+
+    refresh() {
+      if (!this.built) return;
+      const r = this.refs;
+      r.url.value = cfg.webhookUrl;
+      r.secret.value = cfg.sharedSecret;
+      r.label.value = cfg.labelName;
+      r.dry.checked = cfg.dryRun;
+      const configured = cfg.isConfigured();
+      r.conn.textContent = configured ? 'מחובר ל-CRM' : 'לא מוגדר';
+      r.conn.className = 'badge ' + (configured ? 'ok' : 'err');
+      r.mode.textContent = cfg.dryRun ? 'DRY_RUN' : 'שליחה אמיתית';
+      r.mode.className = 'badge ' + (cfg.dryRun ? 'warn' : 'ok');
+    },
+  };
+
+  // הימלטות בסיסית למניעת HTML injection בתצוגת השם/טלפון בפאנל.
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
   }
 
   // ──────────────────────────────── אתחול ────────────────────────────────
   function init() {
-    if (document.body) injectButton();
-    else window.addEventListener('DOMContentLoaded', injectButton);
+    if (document.body) ui.build();
+    else window.addEventListener('DOMContentLoaded', () => ui.build());
   }
 
   init();
