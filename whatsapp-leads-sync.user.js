@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.4.0
+// @version      1.4.1
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
@@ -41,7 +41,7 @@
   'use strict';
 
   // לוג טעינה — אם השורה הזו לא מופיעה בקונסול, הסקריפט עצמו לא רץ (בד"כ @require נכשל).
-  console.log('%c[Leads Sync] v1.4.0 נטען', 'color:#00a884;font-weight:bold');
+  console.log('%c[Leads Sync] v1.4.1 נטען', 'color:#00a884;font-weight:bold');
 
   // ───────────────────────────── מפתחות אחסון ─────────────────────────────
   const STORE = {
@@ -138,6 +138,17 @@
         '%c[Leads Sync] Step 0 — בדיקת תגיות',
         'font-weight:bold;font-size:14px'
       );
+
+      // מצב WPP גולמי לפני ההמתנה — עוזר לאבחן כשל "לא מוכן בזמן".
+      const W = window.WPP;
+      console.log('מצב WPP:', {
+        קיים: typeof W !== 'undefined',
+        version: W && W.version,
+        isReady: W && W.isReady,
+        isMainReady: W && W.isMainReady,
+        hasWaitReady: !!(W && typeof W.waitReady === 'function'),
+      });
+
       const WPP = await waitForWPP();
 
       // 1) ה-API הזמין תחת WPP.labels בגרסת wa-js שלך
@@ -206,27 +217,54 @@
     }
   }
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
   // ──────────────────────────── המתנה ל-wa-js ─────────────────────────────
-  // ממתינים עד ש-WPP נטען ומחובר (WhatsApp Web מאותחל).
-  function waitForWPP(timeoutMs = 60000) {
-    return new Promise((resolve, reject) => {
-      const started = Date.now();
-      const tick = () => {
-        if (typeof window.WPP !== 'undefined' && window.WPP.isReady) {
-          resolve(window.WPP);
-          return;
-        }
-        if (Date.now() - started > timeoutMs) {
-          reject(new Error('wa-js (WPP) לא נטען/לא מוכן בזמן.'));
-          return;
-        }
-        setTimeout(tick, 500);
-      };
-      tick();
-    });
+  // ממתינים עד ש-WPP נטען ומאותחל. מבדיל בין שני כשלים:
+  //   • WPP לא קיים כלל → ה-@require של wa-js לא נטען.
+  //   • WPP קיים אך לא "ready" בזמן → WhatsApp עדיין נטען / חוסר תאימות גרסה.
+  // משתמשים ב-WPP.waitReady() הרשמי אם קיים, עם נפילה ל-polling של isReady.
+  async function waitForWPP(timeoutMs = 90000) {
+    const started = Date.now();
+
+    // 1) להמתין שאובייקט ה-WPP בכלל יופיע (אחרת ה-@require נכשל).
+    while (typeof window.WPP === 'undefined') {
+      if (Date.now() - started > 15000) {
+        throw new Error('wa-js (WPP) לא נטען כלל — בדוק חיבור/@require והתקנה מחדש.');
+      }
+      await sleep(300);
+    }
+
+    const WPP = window.WPP;
+    if (WPP.isReady) return WPP;
+
+    // 2) הדרך הרשמית: WPP.waitReady() מחזיר Promise שמתממש כשהמודולים מוכנים.
+    if (typeof WPP.waitReady === 'function') {
+      let timer;
+      const timeout = new Promise((_, rej) => {
+        timer = setTimeout(
+          () => rej(new Error('wa-js (WPP) נטען אך לא הגיע ל-ready בזמן — ודא ש-WhatsApp Web פתוח ומחובר.')),
+          timeoutMs
+        );
+      });
+      try {
+        await Promise.race([Promise.resolve(WPP.waitReady()), timeout]);
+        return WPP;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    // 3) נפילה: polling על isReady.
+    while (!WPP.isReady) {
+      if (Date.now() - started > timeoutMs) {
+        throw new Error('wa-js (WPP) נטען אך לא הגיע ל-ready בזמן — ודא ש-WhatsApp Web פתוח ומחובר.');
+      }
+      await sleep(500);
+    }
+    return WPP;
   }
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const randDelay = () =>
     SEND_DELAY_MIN_MS +
     Math.floor(Math.random() * (SEND_DELAY_MAX_MS - SEND_DELAY_MIN_MS + 1));
