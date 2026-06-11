@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.11.0
+// @version      1.12.0
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
@@ -41,7 +41,7 @@
   'use strict';
 
   // לוג טעינה — אם השורה הזו לא מופיעה בקונסול, הסקריפט עצמו לא רץ (בד"כ @require נכשל).
-  console.log('%c[Leads Sync] v1.11.0 נטען', 'color:#00a884;font-weight:bold');
+  console.log('%c[Leads Sync] v1.12.0 נטען', 'color:#00a884;font-weight:bold');
 
   // ───────────────────────────── מפתחות אחסון ─────────────────────────────
   const STORE = {
@@ -507,6 +507,13 @@
   async function runSend() {
     const entries = ui.getSelectedEntries(); // [{ index, lead }] — האינדקס לסימון "נשלח"
     if (!entries.length) { ui.status('לא נבחרו לידים לשליחה.', 'warn'); return; }
+
+    // אבטחה: שליחה אמיתית דורשת הגדרות (גם כשהרשימה נטענה דרך "תצוגה").
+    if (!cfg.dryRun && !cfg.isConfigured()) {
+      ui.status('חסרות הגדרות. פתח "הגדרות" והזן כתובת Webhook + מפתח API.', 'error');
+      ui.showSettings(true);
+      return;
+    }
 
     isSyncing = true;
     cancelRequested = false;
@@ -1097,8 +1104,9 @@
           this.status('אין צ\'אטים תחת התגיות שנבחרו.', 'warn');
           return;
         }
-        this.showLeadsTable(leads.map((l) => ({ phone: maskPhone(l.phone), name: l.name })));
-        this.status('תצוגה מקדימה: ' + leads.length + ' לידים (טלפונים ממוסכים).', 'success');
+        // טבלה ניתנת לבחירה — אפשר לסמן ליד בודד וללחוץ "שלח X נבחרים".
+        this.showSelectableLeads(leads);
+        this.status('תצוגה: ' + leads.length + ' לידים. סמן את מי לשלוח ולחץ "שלח" (טלפונים ממוסכים).', 'success');
       } catch (e) {
         this.status('שגיאה בתצוגה מקדימה: ' + (e && e.message ? e.message : e), 'error');
       }
