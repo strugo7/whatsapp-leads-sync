@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.12.0
+// @version      1.12.1
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
@@ -41,7 +41,7 @@
   'use strict';
 
   // לוג טעינה — אם השורה הזו לא מופיעה בקונסול, הסקריפט עצמו לא רץ (בד"כ @require נכשל).
-  console.log('%c[Leads Sync] v1.12.0 נטען', 'color:#00a884;font-weight:bold');
+  console.log('%c[Leads Sync] v1.12.1 נטען', 'color:#00a884;font-weight:bold');
 
   // ───────────────────────────── מפתחות אחסון ─────────────────────────────
   const STORE = {
@@ -664,8 +664,8 @@
     .results-head { position: sticky; top: 0; z-index: 2; background: ${PANEL_BG}; }
     .sel-bar { display: flex; align-items: center; justify-content: space-between; padding: 10px 20px 0; font-size: 12px; color: ${TEXT_SECONDARY}; }
     .sel-count { font-weight: 600; color: ${WA_GOLD}; }
-    .sel-actions { display: flex; gap: 12px; }
-    .sel-actions .link { background: none; border: none; color: ${WA_GOLD}; cursor: pointer; font-size: 12px; font-weight: 600; padding: 0; }
+    .sel-all-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; color: ${WA_GOLD}; font-size: 12px; font-weight: 600; }
+    .sel-all-toggle input { accent-color: ${WA_GOLD}; width: 15px; height: 15px; cursor: pointer; }
     td.cb, th.cbh { width: 36px; text-align: center; }
     .row-cb { accent-color: ${WA_GOLD}; width: 16px; height: 16px; pointer-events: none; }
     tbody tr[data-index] { cursor: pointer; transition: background .12s; }
@@ -1266,6 +1266,16 @@
       }
     },
 
+    // מצב הצ'קבוקס "סמן הכל": מסומן=הכל נבחר, indeterminate=חלקי, ריק=כלום.
+    _updateMaster() {
+      const m = this.root.getElementById('wals-sel-master');
+      if (!m) return;
+      const total = this._tableRows ? this._tableRows.length : 0;
+      const sel = this._selected ? this._selected.size : 0;
+      m.checked = total > 0 && sel === total;
+      m.indeterminate = sel > 0 && sel < total;
+    },
+
     // מרנדר את העמוד הנוכחי + סרגל עימוד; במצב בחירה מוסיף עמודת checkbox וסרגל בחירה.
     _renderTable() {
       if (!this.built) return;
@@ -1303,8 +1313,7 @@
       const selBar = selectMode
         ? '<div class="sel-bar">' +
             '<span class="sel-count" id="wals-sel-count">נבחרו ' + selected.size + ' מתוך ' + total + '</span>' +
-            '<span class="sel-actions"><button class="link" id="wals-sel-all">בחר הכל</button>' +
-            '<button class="link" id="wals-sel-none">נקה הכל</button></span>' +
+            '<label class="sel-all-toggle"><input type="checkbox" id="wals-sel-master"> סמן הכל</label>' +
           '</div>'
         : '';
       const cbHead = selectMode ? '<th class="cbh"></th>' : '';
@@ -1352,22 +1361,21 @@
             const cb = tr.querySelector('.row-cb');
             if (cb) cb.checked = nowSel;
             this._updateSelCount();
+            this._updateMaster();
             this.updateSendButton();
           });
         });
-        // "בחר הכל / נקה הכל" חלים על *כל* הרשימה, לא רק על העמוד המוצג.
-        const selAll = this.root.getElementById('wals-sel-all');
-        if (selAll) selAll.addEventListener('click', () => {
-          for (let k = 0; k < total; k++) this._selected.add(k);
-          this._renderTable();
-          this.updateSendButton();
-        });
-        const selNone = this.root.getElementById('wals-sel-none');
-        if (selNone) selNone.addEventListener('click', () => {
-          this._selected.clear();
-          this._renderTable();
-          this.updateSendButton();
-        });
+        // צ'קבוקס "סמן הכל" — מסמן/מבטל את *כל* הרשימה (לא רק העמוד המוצג).
+        const master = this.root.getElementById('wals-sel-master');
+        if (master) {
+          master.addEventListener('change', () => {
+            if (master.checked) { for (let k = 0; k < total; k++) this._selected.add(k); }
+            else { this._selected.clear(); }
+            this._renderTable();
+            this.updateSendButton();
+          });
+        }
+        this._updateMaster();
       }
     },
 
