@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WhatsApp Leads Sync → Base44
 // @namespace    https://github.com/strugo7/whatsapp-leads-sync
-// @version      1.6.2
+// @version      1.11.0
 // @description  קורא לידים מתויגים ב-WhatsApp Web (READ-ONLY) ושולח אותם ל-CRM ב-Base44. סנכרון בלחיצה בלבד.
 // @author       strugo7
 // @match        https://web.whatsapp.com/*
@@ -41,7 +41,7 @@
   'use strict';
 
   // לוג טעינה — אם השורה הזו לא מופיעה בקונסול, הסקריפט עצמו לא רץ (בד"כ @require נכשל).
-  console.log('%c[Leads Sync] v1.6.2 נטען', 'color:#00a884;font-weight:bold');
+  console.log('%c[Leads Sync] v1.11.0 נטען', 'color:#00a884;font-weight:bold');
 
   // ───────────────────────────── מפתחות אחסון ─────────────────────────────
   const STORE = {
@@ -50,6 +50,8 @@
     LABEL_NAME: 'cfg_label_name', // ישן — נשמר לקריאת מיגרציה בלבד
     LABELS: 'cfg_labels', // JSON של מערך [{id, name}] — בחירת תגיות מרובה
     DRY_RUN: 'cfg_dry_run',
+    PAGE_SIZE: 'cfg_page_size', // כמות שורות לעמוד בטבלת התוצאות
+    PANEL_POS: 'cfg_panel_pos', // מיקום הכפתור הצף/פאנל באחוזי viewport {xPct, yPct}
   };
 
   // כל מפתחות האחסון המקומיים — לשימוש כפתור "מחק נתונים מקומיים".
@@ -60,7 +62,7 @@
   const SEND_DELAY_MAX_MS = 1200;
 
   // ───────────────────────── אחסון מקומי (localStorage) ───────────────────
-  // תחת @grant none אין GM storage, לכן שומרים ב-localStorage. המפתחות מקבלים
+  // ההגדרות נשמרות ב-localStorage (לא GM storage). המפתחות מקבלים
   // prefix כדי לא להתנגש עם WhatsApp, והערכים נשמרים כ-JSON.
   const LS_PREFIX = 'wals_';
   const store = {
@@ -109,6 +111,11 @@
       const v = store.get(STORE.DRY_RUN, true);
       return v === undefined ? true : Boolean(v);
     },
+    // כמות שורות לעמוד בטבלת התוצאות — ברירת מחדל 10.
+    get pageSize() {
+      const v = parseInt(store.get(STORE.PAGE_SIZE, 10), 10);
+      return Number.isFinite(v) && v > 0 ? v : 10;
+    },
     isConfigured() {
       return Boolean(this.webhookUrl && this.sharedSecret);
     },
@@ -116,12 +123,7 @@
 
   // ────────────────────────── פרטיות: עזרים ──────────────────────────────
   // אין שמירה מקומית של טלפונים כלל (אין dedup מקומי) — ה-dedup הסופי קורה
-  // בשרת דרך upsert. מקומית אנחנו רק ממסכים טלפונים בקונסול וחותמים בקשות.
-  function bytesToHex(buf) {
-    return [...new Uint8Array(buf)]
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
-  }
+  // בשרת דרך upsert. מקומית אנחנו רק ממסכים טלפונים בקונסול ובפאנל.
 
   // מיסוך טלפון לתצוגה בקונסול בלבד: +972***67 (לא חושף את המספר המלא).
   function maskPhone(phone) {
@@ -130,24 +132,7 @@
     return '+' + digits.slice(0, 3) + '***' + digits.slice(-2);
   }
 
-  // חתימת HMAC-SHA256 על מחרוזת, מוחזרת כ-hex. הסוד משמש כמפתח ואינו נשלח ברשת.
-  async function hmacSignHex(secret, message) {
-    const key = await crypto.subtle.importKey(
-      'raw',
-      new TextEncoder().encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['sign']
-    );
-    const sig = await crypto.subtle.sign(
-      'HMAC',
-      key,
-      new TextEncoder().encode(message)
-    );
-    return bytesToHex(sig);
-  }
-
-  // הערה: תחת @grant none אין GM_registerMenuCommand — כל הפעולות זמינות דרך
+  // הערה: אין GM_registerMenuCommand בשימוש — כל הפעולות זמינות דרך
   // הפאנל ה-GUI (כפתור צף → סנכרון / בדיקת תגיות / הגדרות / מחיקת נתונים).
 
   // Step 0 — בדיקת מבנה התגיות. מדפיס לקונסול את התגיות ומבנה הצ'אט מתוך IndexedDB.
@@ -156,7 +141,7 @@
       console.log('%c[Leads Sync] Step 0 — בדיקת תגיות (IndexedDB)', 'font-weight:bold;font-size:14px');
       const db = await openWaModelDb();
       console.log('Stores זמינים:', [...db.objectStoreNames]);
-      
+
       const allLabels = await readIdbLabels(db);
       console.table(allLabels.map((l) => ({ id: l.id, name: l.name })));
 
@@ -169,7 +154,7 @@
         const leads = await collectLabeledLeads(db, labelIds, nameById);
         console.log('נמצאו ' + leads.length + ' לידים תחת התגיות הנבחרות.');
         if (leads.length > 0) {
-           console.log('דוגמה לליד ראשון:', { ...leads[0], phone: maskPhone(leads[0].phone) });
+          console.log('דוגמה לליד ראשון:', { ...leads[0], phone: maskPhone(leads[0].phone) });
         }
       }
       db.close();
@@ -197,8 +182,6 @@
       alert('כל הנתונים המקומיים נמחקו.');
     }
   }
-
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ───────────── ייצוא אנשי קשר ל-CSV (מקור: IndexedDB, ללא wa-js) ─────────
   // wa-js תלוי ב-isReady; כשהוא לא מגיע ל-ready (חוסר תאימות גרסה) אין דרך לקרוא
@@ -349,7 +332,7 @@
     return BOM + lines.join('\r\n') + '\r\n';
   }
 
-  // הורדת קובץ מקומי דרך Blob — עובד תחת @grant none (אין צורך ב-GM_download).
+  // הורדת קובץ מקומי דרך Blob — אין צורך ב-GM_download.
   function downloadCsv(filename, csvText) {
     const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -427,8 +410,8 @@
     });
 
     // GM_xmlhttpRequest עוקף CSP לחלוטין — WhatsApp Web חוסם fetch לדומיינים
-    // שלא ב-connect-src (כולל base44.app). זו הסיבה שעברנו מ-@grant none.
-    // הדומיין חייב להופיע ב-@connect (host בלבד) אחרת Tampermonkey יחסום.
+    // שלא ב-connect-src (כולל base44.app). הדומיין חייב להופיע ב-@connect
+    // (host בלבד) אחרת Tampermonkey יחסום.
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'POST',
@@ -443,7 +426,7 @@
             resolve({ status: resp.status });
           } else {
             // אינווריאנט: לא קוראים/מדפיסים את גוף התשובה — עלול להחזיר PII.
-            // רק הסטטוס; הטלפון הממוסך נרשם ב-catch של syncLeads.
+            // רק הסטטוס; הטלפון הממוסך נרשם ב-catch של runSend.
             reject(new Error('HTTP ' + resp.status));
           }
         },
@@ -456,17 +439,40 @@
 
   // ─────────────────────────── זרימת הסנכרון ─────────────────────────────
   let isSyncing = false;
+  let cancelRequested = false;
+  let cancelSleepResolve = null;
 
-  async function syncLeads() {
+  // sleep שניתן לקטיעה: נשבר מוקדם אם בוטל (אחרת הביטול ימתין עד ~1.2ש מיותרות).
+  function cancellableSleep(ms) {
+    return new Promise((resolve) => {
+      if (cancelRequested) { resolve(); return; }
+      const t = setTimeout(() => { cancelSleepResolve = null; resolve(); }, ms);
+      cancelSleepResolve = () => { clearTimeout(t); cancelSleepResolve = null; resolve(); };
+    });
+  }
+
+  // נקרא מה-UI בלחיצה על "בטל": מדליק את הדגל וקוטע מיד את ההשהיה הנוכחית בין לידים.
+  function requestCancel() {
+    if (!isSyncing) return;
+    cancelRequested = true;
+    if (cancelSleepResolve) cancelSleepResolve();
+    if (ui.built) ui.status('מבטל…', 'warn');
+  }
+
+  // לחיצה על כפתור הסנכרון: לחיצה ראשונה טוענת רשימה לבחירה; לחיצה שנייה ("שלח X נבחרים") שולחת.
+  function onSyncClick() {
     if (isSyncing) return;
-    isSyncing = true;
-    ui.open();
-    ui.setBusy(true);
-    ui.clearResults();
+    if (ui.inSelectMode()) runSend();
+    else prepareSync();
+  }
 
+  // שלב 1: טוען לידים ומציג טבלת בחירה (checkbox לכל שורה) — *לא* שולח עדיין.
+  async function prepareSync() {
+    ui.open();
+    ui.clearResults();
     try {
       if (!cfg.dryRun && !cfg.isConfigured()) {
-        ui.status('חסרות הגדרות. פתח "הגדרות" והזן כתובת Webhook + סוד.', 'error');
+        ui.status('חסרות הגדרות. פתח "הגדרות" והזן כתובת Webhook + מפתח API.', 'error');
         ui.showSettings(true);
         return;
       }
@@ -478,38 +484,59 @@
 
       ui.status('קורא לידים מהתגיות (מ-IndexedDB)…', 'info');
       const leads = await collectLeads();
-
-      // אין dedup מקומי — לא שומרים כלום על המכשיר. ה-dedup הסופי הוא ה-upsert
-      // בשרת (לפי טלפון), כך שאפשר לשלוח את אותו ליד שוב בלי ליצור כפילות.
       if (leads.length === 0) {
         ui.status("לא נמצאו צ'אטים תחת התגיות שנבחרו.", 'warn');
         return;
       }
 
-      // טלפונים ממוסכים בלבד לתצוגה (קונסול + פאנל).
-      const masked = leads.map((l) => ({ phone: maskPhone(l.phone), name: l.name }));
+      // מצב בחירה — כברירת מחדל הכל מסומן. הטלפון המלא נשאר בזיכרון בלבד.
+      ui.showSelectableLeads(leads);
+      ui.status(
+        (cfg.dryRun ? 'DRY_RUN: ' : '') +
+        'נטענו ' + leads.length + ' לידים. סמן/בטל ולחץ "שלח".',
+        'info'
+      );
+    } catch (e) {
+      console.error('[Leads Sync] שגיאה:', e);
+      ui.status('שגיאה: ' + (e && e.message ? e.message : e), 'error');
+    }
+  }
 
-      // ── DRY_RUN: רק מציגים, לא שולחים כלום ──
+  // שלב 2: שולח את הלידים שנבחרו (אחד-אחד, השהיה אנושית). DRY_RUN — רק מציג מה היה נשלח.
+  // אין dedup מקומי — ה-dedup הסופי הוא ה-upsert בשרת לפי טלפון.
+  async function runSend() {
+    const entries = ui.getSelectedEntries(); // [{ index, lead }] — האינדקס לסימון "נשלח"
+    if (!entries.length) { ui.status('לא נבחרו לידים לשליחה.', 'warn'); return; }
+
+    isSyncing = true;
+    cancelRequested = false;
+    ui.setBusy(true);
+
+    try {
+      // ── DRY_RUN: לא שולחים כלום — נשארים בטבלת הבחירה ומדווחים מה היה נשלח ──
       if (cfg.dryRun) {
         console.log('%c[Leads Sync] DRY_RUN — לא נשלח כלום.', 'font-weight:bold');
-        console.table(masked);
-        ui.showLeadsTable(masked);
+        console.table(entries.map((e) => ({ phone: maskPhone(e.lead.phone), name: e.lead.name })));
         ui.status(
-          'DRY_RUN: נמצאו ' + leads.length + ' לידים. לא נשלח כלום (טלפונים ממוסכים).',
+          'DRY_RUN: היו נשלחים ' + entries.length + ' לידים נבחרים. לא נשלח כלום (טלפונים ממוסכים).',
           'success'
         );
         return;
       }
 
-      // ── שליחה אמיתית, אחד-אחד עם השהיה אנושית. השרת עושה upsert לפי טלפון. ──
+      // ── שליחה אמיתית. השרת עושה upsert לפי טלפון. הביטול עוצר לפני הליד הבא. ──
       let okCount = 0;
       let failCount = 0;
-      for (let i = 0; i < leads.length; i++) {
-        const lead = leads[i];
-        ui.status('שולח ' + (i + 1) + ' מתוך ' + leads.length + '…', 'info');
+      const sentIndices = []; // לידים שנשלחו בהצלחה — לסימון זהב בטבלה
+      ui.setCancelVisible(true);
+      for (let i = 0; i < entries.length; i++) {
+        if (cancelRequested) break; // נקודת עצירה לפני כל ליד
+        const { index, lead } = entries[i];
+        ui.status('שולח ' + (i + 1) + ' מתוך ' + entries.length + '…', 'info');
         try {
           await postLead(lead);
           okCount++;
+          sentIndices.push(index);
         } catch (e) {
           failCount++;
           // טלפון ממוסך בלבד בקונסול, ורק הודעת השגיאה (ללא גוף תשובה).
@@ -519,22 +546,35 @@
             e && e.message ? e.message : e
           );
         }
-        await sleep(randDelay());
+        await cancellableSleep(randDelay());
       }
+      ui.setCancelVisible(false);
 
-      ui.showLeadsTable(masked);
-      ui.status(
-        'הסתיים. נשלחו: ' + okCount +
+      // מסמן את שנשלחו (זהב 50%) ומבטל את בחירתם — נשארים בטבלת הבחירה.
+      ui.markSent(sentIndices);
+      if (cancelRequested) {
+        ui.status(
+          'בוטל. נשלחו ' + okCount + ' מתוך ' + entries.length +
+          (failCount ? ' · נכשלו: ' + failCount : ''),
+          'warn'
+        );
+      } else {
+        ui.status(
+          'הסתיים. נשלחו: ' + okCount +
           (failCount ? ' · נכשלו: ' + failCount : '') +
           ' (ה-CRM מאחד לפי טלפון).',
-        failCount ? 'warn' : 'success'
-      );
+          failCount ? 'warn' : 'success'
+        );
+      }
     } catch (e) {
       console.error('[Leads Sync] שגיאה:', e);
       ui.status('שגיאה: ' + (e && e.message ? e.message : e), 'error');
     } finally {
       isSyncing = false;
+      cancelRequested = false;
+      cancelSleepResolve = null;
       ui.setBusy(false);
+      ui.setCancelVisible(false);
     }
   }
 
@@ -556,6 +596,7 @@
       width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer;
       background: ${WA_GOLD}; color: #111; font-size: 24px; line-height: 1;
       box-shadow: 0 4px 14px rgba(0,0,0,.5); transition: transform .12s ease;
+      touch-action: none; /* גרירה במגע לא תגלול את הדף */
     }
     .launcher:hover { transform: scale(1.06); }
     .panel {
@@ -574,7 +615,7 @@
 
     .hdr {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 16px 20px 12px;
+      padding: 16px 20px 12px; cursor: move; touch-action: none;
     }
     .hdr .title-wrap { display: flex; align-items: center; gap: 8px; color: ${WA_GOLD}; }
     .hdr .title { font-weight: 800; font-size: 20px; letter-spacing: 1px; }
@@ -603,10 +644,39 @@
     .action-btn span { font-size: 11px; font-weight: 600; }
 
     .table-container { border-top: 1px solid ${BORDER_COLOR}; border-bottom: 1px solid ${BORDER_COLOR}; }
+    .results { max-height: 320px; overflow-y: auto; }
+    .results::-webkit-scrollbar { width: 6px; }
+    .results::-webkit-scrollbar-track { background: transparent; }
+    .results::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { text-align: start; padding: 12px 20px; border-bottom: 1px solid rgba(255,255,255,0.04); }
     th { color: ${TEXT_SECONDARY}; font-weight: 600; font-size: 12px; }
     tr:last-child td { border-bottom: none; }
+
+    /* עימוד + בחירה ידנית של טבלת התוצאות */
+    .results-head { position: sticky; top: 0; z-index: 2; background: ${PANEL_BG}; }
+    .sel-bar { display: flex; align-items: center; justify-content: space-between; padding: 10px 20px 0; font-size: 12px; color: ${TEXT_SECONDARY}; }
+    .sel-count { font-weight: 600; color: ${WA_GOLD}; }
+    .sel-actions { display: flex; gap: 12px; }
+    .sel-actions .link { background: none; border: none; color: ${WA_GOLD}; cursor: pointer; font-size: 12px; font-weight: 600; padding: 0; }
+    td.cb, th.cbh { width: 36px; text-align: center; }
+    .row-cb { accent-color: ${WA_GOLD}; width: 16px; height: 16px; pointer-events: none; }
+    tbody tr[data-index] { cursor: pointer; transition: background .12s; }
+    /* כבר נשלח (זיכרון סשן) — זהב בשקיפות 50% */
+    tbody tr.sent td { background: rgba(212,175,55,0.5); }
+    /* נבחר לשליחה — רקע לבן וטקסט שחור (גובר על "נשלח") */
+    tbody tr.selected td,
+    tbody tr.selected td.num,
+    tbody tr.selected td.ph,
+    tbody tr.selected td.name { background: #ffffff; color: #111111; }
+    .page-bar { display: flex; align-items: center; justify-content: space-between; padding: 10px 20px; font-size: 12px; color: ${TEXT_SECONDARY}; }
+    .page-info { font-weight: 600; }
+    .page-size { display: flex; align-items: center; gap: 6px; margin: 0; }
+    .page-size select { background: #111; color: #fff; border: 1px solid ${BORDER_COLOR}; border-radius: 6px; padding: 4px 6px; font-size: 12px; cursor: pointer; }
+    .page-size select:focus { outline: none; border-color: ${WA_GOLD}; }
+    .page-foot { padding: 10px 20px 14px; text-align: center; }
+    .page-more { background: ${WA_GOLD_DIM}; color: ${WA_GOLD}; border: 1px solid ${WA_GOLD}; border-radius: 8px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .page-more:hover { background: rgba(212,175,55,0.18); }
     td.num { color: ${WA_GOLD}; font-weight: 700; width: 40px; }
     td.ph { direction: ltr; text-align: right; color: #e0e0e0; font-variant-numeric: tabular-nums; }
     td.name { color: #fff; }
@@ -625,15 +695,16 @@
     .lbl-list { max-height: 160px; overflow-y: auto; border: 1px solid ${BORDER_COLOR}; background: #111; border-radius: 8px; padding: 6px; }
     .lbl-list::-webkit-scrollbar { width: 4px; }
     .lbl-list::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
-    .lbl-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; font-weight: 500; color: #ddd; cursor: pointer; border-radius: 6px; transition: background 0.15s; margin-bottom: 2px; }
+    .lbl-row { display: grid; grid-template-columns: 18px 12px 1fr; align-items: center; gap: 10px; padding: 6px 10px; color: #ddd; cursor: pointer; border-radius: 6px; transition: background 0.15s; margin-bottom: 2px; }
     .lbl-row:hover { background: rgba(255,255,255,0.05); }
+    .lbl-row:has(input:checked) { background: ${WA_GOLD_DIM}; }
     .lbl-row input { display: none; }
     .custom-cb { width: 18px; height: 18px; border: 2px solid #555; border-radius: 4px; display: flex; align-items: center; justify-content: center; transition: all 0.2s; flex: 0 0 auto; }
     .lbl-row input:checked ~ .custom-cb { background: ${WA_GOLD}; border-color: ${WA_GOLD}; }
     .custom-cb::after { content: ''; width: 4px; height: 8px; border: solid #111; border-width: 0 2px 2px 0; transform: rotate(45deg); opacity: 0; transition: opacity 0.2s; margin-bottom: 2px; }
     .lbl-row input:checked ~ .custom-cb::after { opacity: 1; }
     .lbl-dot { width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto; border: 1px solid rgba(255,255,255,.1); }
-    .lbl-text { flex: 1; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .lbl-text { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .lbl-muted { color: #555; font-size: 12px; padding: 6px 4px; }
     .lbl-count { font-size: 12px; color: ${WA_GOLD}; margin-top: 8px; font-weight: 600; }
     .settings-actions { display: flex; gap: 10px; margin-top: 16px; }
@@ -657,6 +728,14 @@
     button.primary.huge:hover { background: #f5c85b; }
     button.primary.huge:disabled { opacity: .55; cursor: not-allowed; }
     button.primary.huge svg { width: 20px; height: 20px; fill: currentColor; }
+
+    button.danger.huge {
+      width: 100%; padding: 16px; margin-top: 10px; border: none; border-radius: 8px; cursor: pointer;
+      background: #ff4a4a; color: #fff; font-size: 16px; font-weight: 700;
+      transition: background 0.2s;
+    }
+    button.danger.huge:hover { background: #ff6b6b; }
+    button.danger.huge[hidden] { display: none; }
 
     .foot { margin: 16px 0 0; font-size: 11px; color: #555; text-align: center; }
     
@@ -721,7 +800,7 @@
         <label>כתובת Webhook (HTTPS)
           <input type="url" id="wals-url" placeholder="https://...base44.app/...">
         </label>
-        <label>סוד משותף (לחתימת HMAC)
+        <label>מפתח API (נשלח בכותרת x-api-key)
           <input type="password" id="wals-secret" placeholder="••••••••">
         </label>
         <div class="lbl-head" style="margin-top:12px;">
@@ -743,6 +822,7 @@
           התחל שליחה
           ${ICONS.send}
         </button>
+        <button class="danger huge" id="wals-cancel" hidden>בטל שליחה</button>
         <div class="foot">READ-ONLY · סנכרון בלחיצה בלבד</div>
       </div>
     </div>
@@ -773,6 +853,7 @@
       this.refs = {
         launch: $('wals-launch'), panel: $('wals-panel'), close: $('wals-close'),
         conn: $('wals-conn'), mode: $('wals-mode'), sync: $('wals-sync'),
+        cancel: $('wals-cancel'),
         dry: $('wals-dry'), step0: $('wals-step0'), settingsBtn: $('wals-settings-btn'),
         export: $('wals-export'),
         settings: $('wals-settings'), url: $('wals-url'), secret: $('wals-secret'),
@@ -783,9 +864,10 @@
       };
 
       const r = this.refs;
-      r.launch.addEventListener('click', () => this.toggle());
+      // לחיצה/גרירה על הכפתור הצף מטופלים ב-setupDrag (Pointer Events) — לא click רגיל.
       r.close.addEventListener('click', () => this.close());
-      r.sync.addEventListener('click', syncLeads);
+      r.sync.addEventListener('click', onSyncClick);
+      r.cancel.addEventListener('click', requestCancel);
       r.step0.addEventListener('click', runLabelDiagnostics);
       r.export.addEventListener('click', () => this.exportContactsCsv());
       r.settingsBtn.addEventListener('click', () => this.showSettings());
@@ -800,12 +882,126 @@
       });
 
       this.built = true;
+      this.setupDrag();
+      this._loadPos();
       this.refresh();
     },
 
-    open() { this.build(); this.refs.panel.hidden = false; this.refresh(); },
+    open() { this.build(); this.refs.panel.hidden = false; this.refresh(); this._reposition(); },
     close() { if (this.built) this.refs.panel.hidden = true; },
-    toggle() { this.build(); this.refs.panel.hidden = !this.refs.panel.hidden; if (!this.refs.panel.hidden) this.refresh(); },
+    toggle() { this.build(); this.refs.panel.hidden = !this.refs.panel.hidden; if (!this.refs.panel.hidden) { this.refresh(); this._reposition(); } },
+
+    // אם המשתמש גרר (או נטען מיקום שמור) — ממקם את הפאנל יחסית לכפתור הצף.
+    _reposition() { if (this._pos && this._positionPanel) this._positionPanel(); },
+
+    // שמירת מיקום הכפתור הצף באחוזי viewport (עמיד לשינוי גודל חלון).
+    _savePos() {
+      if (!this._pos) return;
+      store.set(STORE.PANEL_POS, {
+        xPct: this._pos.x / window.innerWidth * 100,
+        yPct: this._pos.y / window.innerHeight * 100,
+      });
+    },
+
+    // טעינת מיקום שמור והחלתו על הכפתור הצף.
+    _loadPos() {
+      const p = store.get(STORE.PANEL_POS, null);
+      if (!p || typeof p.xPct !== 'number' || typeof p.yPct !== 'number') return;
+      if (!this._applyLauncherPos) return;
+      this._applyLauncherPos(p.xPct / 100 * window.innerWidth, p.yPct / 100 * window.innerHeight);
+    },
+
+    // Pointer Events: גרירת הכפתור הצף או ה-header מזיזים את ה"עוגן"; הפאנל עוקב.
+    setupDrag() {
+      const launcher = this.refs.launch;
+      const panel = this.refs.panel;
+      const hdr = this.root.querySelector('.hdr');
+      const GAP = 12;
+      const THRESH = 5; // סף תזוזה: מתחתיו לחיצה (toggle), מעליו גרירה
+
+      const clampLauncher = (x, y) => {
+        const w = launcher.offsetWidth || 56;
+        const h = launcher.offsetHeight || 56;
+        return [
+          Math.max(0, Math.min(x, window.innerWidth - w)),
+          Math.max(0, Math.min(y, window.innerHeight - h)),
+        ];
+      };
+
+      const applyLauncherPos = (x, y) => {
+        const [cx, cy] = clampLauncher(x, y);
+        launcher.style.left = cx + 'px';
+        launcher.style.top = cy + 'px';
+        launcher.style.bottom = 'auto';
+        launcher.style.insetInlineStart = 'auto';
+        this._pos = { x: cx, y: cy };
+      };
+      this._applyLauncherPos = applyLauncherPos;
+
+      const positionPanel = () => {
+        if (panel.hidden) return;
+        const lr = launcher.getBoundingClientRect();
+        const pw = panel.offsetWidth || 360;
+        // בוחרים את הכיוון עם יותר מקום, ומגבילים את גובה הפאנל למקום הפנוי
+        // (עם גלילה פנימית) — כך כל הכפתורים תמיד נגישים, גם בקצוות המסך.
+        const spaceBelow = window.innerHeight - lr.bottom - GAP - 8;
+        const spaceAbove = lr.top - GAP - 8;
+        const openDown = spaceBelow >= spaceAbove;
+        const avail = Math.max(160, openDown ? spaceBelow : spaceAbove);
+        const cap = Math.min(window.innerHeight * 0.85, avail);
+        panel.style.maxHeight = cap + 'px';
+        const ph = Math.min(panel.offsetHeight || 0, cap); // קורא אחרי קביעת max-height
+        // אנכי לפי הכיוון שנבחר; אופקי: כפתור בחצי הימני → יישור ימינה, אחרת שמאלה.
+        let top = openDown ? lr.bottom + GAP : lr.top - GAP - ph;
+        let left = lr.left > window.innerWidth / 2 ? lr.right - pw : lr.left;
+        left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
+        top = Math.max(8, Math.min(top, window.innerHeight - ph - 8));
+        panel.style.left = left + 'px';
+        panel.style.top = top + 'px';
+        panel.style.bottom = 'auto';
+        panel.style.insetInlineStart = 'auto';
+      };
+      this._positionPanel = positionPanel;
+
+      const startDrag = (e, isLauncher) => {
+        // לחיצה על כפתור פעולה בתוך ה-header (כמו "סגור") אינה גרירה.
+        if (!isLauncher && e.target.closest('button')) return;
+        const handle = isLauncher ? launcher : hdr;
+        try { handle.setPointerCapture(e.pointerId); } catch (e2) { }
+        const startX = e.clientX, startY = e.clientY;
+        const lr = launcher.getBoundingClientRect();
+        const baseX = lr.left, baseY = lr.top;
+        let dragging = false;
+
+        const onMove = (ev) => {
+          const dx = ev.clientX - startX, dy = ev.clientY - startY;
+          if (!dragging && Math.hypot(dx, dy) < THRESH) return;
+          dragging = true;
+          applyLauncherPos(baseX + dx, baseY + dy);
+          positionPanel();
+        };
+        const onUp = () => {
+          handle.removeEventListener('pointermove', onMove);
+          handle.removeEventListener('pointerup', onUp);
+          try { handle.releasePointerCapture(e.pointerId); } catch (e2) { }
+          if (dragging) {
+            this._savePos();
+          } else if (isLauncher) {
+            this.toggle();
+          }
+        };
+        handle.addEventListener('pointermove', onMove);
+        handle.addEventListener('pointerup', onUp);
+      };
+
+      launcher.addEventListener('pointerdown', (e) => startDrag(e, true));
+      hdr.addEventListener('pointerdown', (e) => startDrag(e, false));
+
+      // שינוי גודל חלון — clamp מחדש כדי שהכלי לא יישאר מחוץ למסך.
+      window.addEventListener('resize', () => {
+        if (this._pos) { applyLauncherPos(this._pos.x, this._pos.y); positionPanel(); }
+      });
+    },
 
     showSettings(force) {
       if (!this.built) return;
@@ -837,6 +1033,9 @@
         this._labelsLoaded = true;
         return;
       }
+
+      // מיון אלפביתי (עברית) — סדר ה-IndexedDB שרירותי.
+      labels.sort((a, b) => String(a.name).localeCompare(String(b.name), 'he'));
 
       // אילו מסומנות לפי מה ששמור (התאמה לפי id או שם).
       const selected = cfg.selectedLabels;
@@ -940,9 +1139,9 @@
 
         // תצוגה בפאנל — טלפונים ממוסכים בלבד (הקובץ מכיל מלא, הפאנל לא חושף).
         const withPhone = rows.filter((r) => r.phone).length;
-        this.showLeadsTable(rows.slice(0, 50).map((r) => ({ phone: maskPhone(r.phone), name: r.name })));
+        this.showLeadsTable(rows.map((r) => ({ phone: maskPhone(r.phone), name: r.name })));
         this.status(
-          'הורד CSV עם ' + rows.length + ' לידים (' + withPhone + ' עם טלפון). מוצגים עד 50, טלפונים ממוסכים בפאנל.',
+          'הורד CSV עם ' + rows.length + ' לידים (' + withPhone + ' עם טלפון). טלפונים ממוסכים בפאנל.',
           'success'
         );
         console.log('[Leads Sync] CSV יוצא:', rows.length, 'לידים (טלפונים מלאים בקובץ בלבד).');
@@ -957,7 +1156,16 @@
     setBusy(busy) {
       if (!this.built) return;
       this.refs.sync.disabled = busy;
-      this.refs.sync.innerHTML = busy ? 'מסנכרן…' : 'התחל שליחה ' + ICONS.send;
+      if (busy) { this.refs.sync.innerHTML = 'מסנכרן…'; return; }
+      // בסיום: במצב בחירה מחזירים "שלח N נבחרים"; אחרת התווית הרגילה.
+      if (this._selectMode) this.updateSendButton();
+      else this.refs.sync.innerHTML = 'התחל שליחה ' + ICONS.send;
+    },
+
+    // מציג/מסתיר את כפתור "בטל שליחה" (רק במהלך שליחה אמיתית, לא ב-DRY_RUN).
+    setCancelVisible(visible) {
+      if (!this.built) return;
+      this.refs.cancel.hidden = !visible;
     },
 
     status(text, type) {
@@ -966,20 +1174,193 @@
       this.refs.status.textContent = text || '';
     },
 
-    clearResults() { if (this.built) this.refs.results.innerHTML = ''; },
+    clearResults() {
+      if (!this.built) return;
+      this.refs.results.innerHTML = '';
+      this._tableRows = [];
+      // יציאה ממצב בחירה — להחזיר את כפתור הסנכרון לתווית ולמצב פעיל.
+      if (this._selectMode) {
+        this.refs.sync.disabled = false;
+        this.refs.sync.innerHTML = 'התחל שליחה ' + ICONS.send;
+      }
+      this._selectMode = false;
+      this._leads = null;
+      this._selected = null;
+      this._sent = null;
+    },
 
+    // טבלת תצוגה רגילה (ללא בחירה) — סיכום/תצוגה מקדימה/ייצוא. כבר ממוסך.
     showLeadsTable(rows) {
       if (!this.built) return;
+      this._selectMode = false;
+      this._leads = null;
+      this._selected = null;
+      this._tableRows = Array.isArray(rows) ? rows : [];
+      this._pageSize = cfg.pageSize;
+      this._shown = Math.min(this._pageSize, this._tableRows.length);
+      this._renderTable();
+    },
+
+    // ── בחירה ידנית: טוען את הלידים המלאים לזיכרון JS בלבד ומציג טבלה עם checkbox ──
+    // הטלפון המלא נשאר ב-this._leads (זיכרון), ב-DOM יש רק data-index. ברירת מחדל: הכל מסומן.
+    showSelectableLeads(leads) {
+      if (!this.built) return;
+      this._leads = Array.isArray(leads) ? leads : [];
+      this._tableRows = this._leads.map((l) => ({ phone: maskPhone(l.phone), name: l.name }));
+      this._selected = new Set(this._leads.map((_, i) => i));
+      this._sent = new Set(); // אילו לידים כבר נשלחו בסשן הנוכחי (לא נשמר לרענון)
+      this._selectMode = true;
+      this._pageSize = cfg.pageSize;
+      this._shown = Math.min(this._pageSize, this._tableRows.length);
+      this._renderTable();
+      this.updateSendButton();
+    },
+
+    inSelectMode() { return !!this._selectMode; },
+
+    // הלידים שנבחרו עם האינדקס המקורי — מתוך הזיכרון (כולל טלפון מלא, לא מ-DOM).
+    getSelectedEntries() {
+      if (!this._leads || !this._selected) return [];
+      const out = [];
+      this._leads.forEach((lead, i) => { if (this._selected.has(i)) out.push({ index: i, lead }); });
+      return out;
+    },
+
+    // מסמן לידים שנשלחו בהצלחה (זיכרון סשן): זהב 50%, ומבטל את בחירתם.
+    markSent(indices) {
+      if (!this._sent) this._sent = new Set();
+      for (const i of indices) { this._sent.add(i); if (this._selected) this._selected.delete(i); }
+      this._renderTable();
+      this.updateSendButton();
+    },
+
+    exitSelectMode() {
+      this._selectMode = false;
+      this._leads = null;
+      this._selected = null;
+      this._sent = null;
+    },
+
+    // עדכון תווית כפתור השליחה במצב בחירה ("שלח X נבחרים"; מושבת ב-0).
+    updateSendButton() {
+      if (!this.built || !this._selectMode) return;
+      const n = this._selected ? this._selected.size : 0;
+      this.refs.sync.disabled = n === 0;
+      this.refs.sync.textContent = 'שלח ' + n + ' נבחרים';
+    },
+
+    _updateSelCount() {
+      const el = this.root.getElementById('wals-sel-count');
+      if (el) {
+        const sel = this._selected ? this._selected.size : 0;
+        const total = this._tableRows ? this._tableRows.length : 0;
+        el.textContent = 'נבחרו ' + sel + ' מתוך ' + total;
+      }
+    },
+
+    // מרנדר את העמוד הנוכחי + סרגל עימוד; במצב בחירה מוסיף עמודת checkbox וסרגל בחירה.
+    _renderTable() {
+      if (!this.built) return;
+      const rows = this._tableRows || [];
+      const total = rows.length;
+      if (total === 0) { this.refs.results.innerHTML = ''; return; }
+
+      const selectMode = !!this._selectMode;
+      const selected = this._selected || new Set();
+      const sent = this._sent || new Set();
+      const pageSize = this._pageSize || cfg.pageSize;
+      const shown = Math.min(this._shown || pageSize, total);
+
       const body = rows
-        .map(
-          (x, i) =>
-            '<tr><td class="num">' + (i + 1) + '</td><td class="ph">' + escapeHtml(x.phone) + '</td><td class="name">' + escapeHtml(x.name) + '</td></tr>'
-        )
+        .slice(0, shown)
+        .map((x, i) => {
+          let cbCell = '', trCls = '', trAttr = '';
+          if (selectMode) {
+            const isSel = selected.has(i);
+            cbCell = '<td class="cb"><input type="checkbox" class="row-cb"' + (isSel ? ' checked' : '') + '></td>';
+            trCls = ' class="' + ((isSel ? 'selected' : '') + (sent.has(i) ? ' sent' : '')).trim() + '"';
+            trAttr = ' data-index="' + i + '"';
+          }
+          return '<tr' + trAttr + trCls + '>' + cbCell + '<td class="num">' + (i + 1) + '</td><td class="ph">' + escapeHtml(x.phone) + '</td><td class="name">' + escapeHtml(x.name) + '</td></tr>';
+        })
         .join('');
+
+      const opts = [10, 15, 20, 50]
+        .map((s) => '<option value="' + s + '"' + (s === pageSize ? ' selected' : '') + '>' + s + '</option>')
+        .join('');
+      const moreBtn = shown < total
+        ? '<div class="page-foot"><button class="page-more" id="wals-page-more">הצג עוד</button></div>'
+        : '';
+
+      const selBar = selectMode
+        ? '<div class="sel-bar">' +
+            '<span class="sel-count" id="wals-sel-count">נבחרו ' + selected.size + ' מתוך ' + total + '</span>' +
+            '<span class="sel-actions"><button class="link" id="wals-sel-all">בחר הכל</button>' +
+            '<button class="link" id="wals-sel-none">נקה הכל</button></span>' +
+          '</div>'
+        : '';
+      const cbHead = selectMode ? '<th class="cbh"></th>' : '';
+
       this.refs.results.innerHTML =
-        '<table><thead><tr><th></th><th>מספר נייד</th><th>שם</th></tr></thead><tbody>' +
+        '<div class="results-head">' +
+        selBar +
+        '<div class="page-bar">' +
+        '<span class="page-info">מציג ' + shown + ' מתוך ' + total + '</span>' +
+        '<label class="page-size">שורות לעמוד <select id="wals-page-size">' + opts + '</select></label>' +
+        '</div>' +
+        '</div>' +
+        '<table><thead><tr>' + cbHead + '<th></th><th>מספר נייד</th><th>שם</th></tr></thead><tbody>' +
         body +
-        '</tbody></table>';
+        '</tbody></table>' +
+        moreBtn;
+
+      const more = this.root.getElementById('wals-page-more');
+      if (more) {
+        more.addEventListener('click', () => {
+          this._shown = Math.min(shown + pageSize, total);
+          this._renderTable();
+        });
+      }
+      const sel = this.root.getElementById('wals-page-size');
+      if (sel) {
+        sel.addEventListener('change', () => {
+          const v = parseInt(sel.value, 10) || 10;
+          store.set(STORE.PAGE_SIZE, v);
+          this._pageSize = v;
+          this._shown = Math.min(v, total); // רינדור מחדש מההתחלה
+          this._renderTable();
+        });
+      }
+
+      if (selectMode) {
+        // לחיצה על כל השורה (לא רק על ה-checkbox) מסמנת/מבטלת — משפיע רק עליה.
+        this.refs.results.querySelectorAll('tr[data-index]').forEach((tr) => {
+          tr.addEventListener('click', () => {
+            const idx = parseInt(tr.getAttribute('data-index'), 10);
+            const nowSel = !this._selected.has(idx);
+            if (nowSel) this._selected.add(idx);
+            else this._selected.delete(idx);
+            tr.classList.toggle('selected', nowSel);
+            const cb = tr.querySelector('.row-cb');
+            if (cb) cb.checked = nowSel;
+            this._updateSelCount();
+            this.updateSendButton();
+          });
+        });
+        // "בחר הכל / נקה הכל" חלים על *כל* הרשימה, לא רק על העמוד המוצג.
+        const selAll = this.root.getElementById('wals-sel-all');
+        if (selAll) selAll.addEventListener('click', () => {
+          for (let k = 0; k < total; k++) this._selected.add(k);
+          this._renderTable();
+          this.updateSendButton();
+        });
+        const selNone = this.root.getElementById('wals-sel-none');
+        if (selNone) selNone.addEventListener('click', () => {
+          this._selected.clear();
+          this._renderTable();
+          this.updateSendButton();
+        });
+      }
     },
 
     saveSettings() {
